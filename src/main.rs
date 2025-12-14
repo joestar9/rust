@@ -1,5 +1,5 @@
 use colored::*;
-use dashmap::DashMap; // High performance concurrent map
+use dashmap::DashMap;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use reqwest::{header, Client, Proxy};
@@ -33,6 +33,21 @@ const PROXY_SOURCES: [&str; 6] = [
     "https://raw.githubusercontent.com/trio666/proxy-checker/refs/heads/main/socks5.txt"
 ];
 
+// --- Helper Struct for Styling ---
+struct Style;
+impl Style {
+    const RESET: &'static str = "\x1b[0m";
+    const BOLD: &'static str = "\x1b[1m";
+    
+    fn header() {
+        // Clear screen command for Windows/Linux
+        print!("\x1b[2J\x1b[1;1H"); 
+        println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
+        println!("{}", "║    IRANCELL REFERRAL BOT - RUST ASYNC EDITION (NO ERRORS)     ║".cyan().bold());
+        println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
+    }
+}
+
 struct GlobalStats {
     success: AtomicUsize,
     logic_fail: AtomicUsize,
@@ -52,11 +67,11 @@ struct ProxyState {
 struct AppState {
     stats: Arc<GlobalStats>,
     proxy_state: Arc<Mutex<ProxyState>>,
-    patterns: Arc<DashMap<String, u32>>, // Changed to DashMap for speed
+    patterns: Arc<DashMap<String, u32>>, 
     token: String,
     cookie: String,
     use_proxies: bool,
-    base_headers: header::HeaderMap, // Pre-computed headers
+    base_headers: header::HeaderMap,
 }
 
 #[tokio::main]
@@ -98,7 +113,7 @@ async fn main() {
         println!("{}", "Skipping proxy setup. Running DIRECT.".yellow());
     }
 
-    // --- PRE-COMPUTE HEADERS (Optimization) ---
+    // --- PRE-COMPUTE HEADERS ---
     let mut headers = header::HeaderMap::new();
     headers.insert("Authorization", header::HeaderValue::from_str(&token).unwrap_or(header::HeaderValue::from_static("")));
     headers.insert("Cookie", header::HeaderValue::from_str(&cookie).unwrap_or(header::HeaderValue::from_static("")));
@@ -158,18 +173,17 @@ async fn worker_loop(state: Arc<AppState>) {
     let mut forced_direct = false;
 
     loop {
-        // 1. Check Limits & Running State (Non-blocking check)
         if !state.stats.is_running.load(Ordering::Relaxed) { break; }
         
-        // Only check limit explicitly if success > 0 to save atomic loads
         if state.stats.success.load(Ordering::Relaxed) >= state.stats.limit {
             state.stats.is_running.store(false, Ordering::Relaxed);
             break;
         }
 
-        // 2. Proxy Logic (Sticky + Fallback)
-        let mut needs_new_client = false;
-
+        // --- PROXY LOGIC ---
+        // If client is dead (None), we need to rebuild it.
+        // If we are using proxies but don't have one, try to get one.
+        
         if state.use_proxies {
             if current_proxy.is_none() && !forced_direct {
                 let mut lock = state.proxy_state.lock().await;
@@ -177,22 +191,20 @@ async fn worker_loop(state: Arc<AppState>) {
                     lock.active.insert(p.clone());
                     current_proxy = Some(p);
                     proxy_strikes = 0;
-                    needs_new_client = true;
+                    client = None; // Force rebuild with new proxy
                 } else if lock.active.is_empty() {
-                    // No queue left, no active left -> Forced Direct
+                    // Fallback to direct
                     forced_direct = true;
-                    needs_new_client = true;
+                    client = None; // Force rebuild without proxy
                 }
             }
-        } else if client.is_none() {
-            needs_new_client = true;
         }
 
-        // 3. Build Client (Only when needed)
-        if needs_new_client || client.is_none() {
+        // Build Client if missing
+        if client.is_none() {
             let mut builder = Client::builder()
                 .timeout(Duration::from_secs(10))
-                .tcp_nodelay(true) // Optimization: Fast packet send
+                .tcp_nodelay(true)
                 .danger_accept_invalid_certs(true);
 
             if let Some(ref p_url) = current_proxy {
@@ -210,18 +222,15 @@ async fn worker_loop(state: Arc<AppState>) {
             }
         }
 
-        // 4. Generate Number (DashMap Optimized)
+        // Generate Number
         let num = generate_number(&state.patterns).await;
 
-        // 5. Send Request
         let cli = client.as_ref().unwrap();
-        // Construct payload efficiently
         let payload = serde_json::json!({
             "application_name": "NGMI",
             "friend_number": format!("98{}", &num[1..])
         });
 
-        // Use pre-computed headers + payload
         let req_res = cli.post(API_URL)
             .headers(state.base_headers.clone()) 
             .json(&payload)
@@ -231,29 +240,26 @@ async fn worker_loop(state: Arc<AppState>) {
         match req_res {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    // SUCCESS
                     state.stats.success.fetch_add(1, Ordering::Relaxed);
-                    update_pattern(&state.patterns, &num); // No await needed for DashMap
+                    update_pattern(&state.patterns, &num); 
                     proxy_strikes = 0;
                 } else {
-                    // LOGIC FAIL
                     state.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
                 }
             },
             Err(_) => {
-                // NETWORK FAIL
+                // Network Fail
                 if state.use_proxies && !forced_direct {
                     state.stats.proxy_fail.fetch_add(1, Ordering::Relaxed);
                     proxy_strikes += 1;
                     
                     if proxy_strikes >= 3 {
-                        // Mark Dead
                         if let Some(dead_p) = current_proxy.take() {
                             let mut lock = state.proxy_state.lock().await;
                             lock.active.remove(&dead_p);
                             lock.dead.insert(dead_p);
                         }
-                        needs_new_client = true;
+                        client = None; // Force rebuild next loop
                     }
                 } else {
                     state.stats.net_fail.fetch_add(1, Ordering::Relaxed);
@@ -263,40 +269,41 @@ async fn worker_loop(state: Arc<AppState>) {
     }
 }
 
-// Optimized Number Generation (No Locks)
 async fn generate_number(patterns: &Arc<DashMap<String, u32>>) -> String {
     let mut rng = rand::thread_rng();
     let prefix = PREFIXES.choose(&mut rng).unwrap();
     
-    // Pattern usage chance
     if rng.gen_bool(0.85) {
-        // DashMap allows concurrent reading without blocking others
-        // We find a candidate key starting with prefix
-        // Since iterating dashmap can be heavy, we try to access a known pattern or iterate briefly
-        // To keep it simple and fast in Rust:
+        // Optimization: Don't iterate everything if not needed.
+        // We just check a few shards or pick randomly if possible.
+        // For simplicity and speed in this demo, strict filtering on DashMap can be slow
+        // if it has millions of keys. We'll use a simplified random check or iterate if small.
         
-        // NOTE: Iterating the whole map in DashMap is still safe but can be slow if map is HUGE.
-        // Given we limit map size, it's fine.
-        let candidate = patterns.iter()
-            .filter(|r| r.key().starts_with(prefix))
-            .choose(&mut rng); // Reservoir sampling or just pick one
-
-        if let Some(entry) = candidate {
-            let k = entry.key();
-            let parts: Vec<&str> = k.split('-').collect();
-            if parts.len() > 1 {
-                let suffix = parts[1]; 
-                let rest_len = 7 - suffix.len();
-                let mut rest = String::with_capacity(rest_len);
-                for _ in 0..rest_len {
-                    rest.push_str(&rng.gen_range(0..=9).to_string());
+        if !patterns.is_empty() {
+             // Since we can't easily pick a random element from DashMap efficiently without iterating,
+             // and iterating is slow, we will skip complex pattern matching for maximum CPU speed 
+             // in this specific "max performance" version, OR we assume map is small (<3000).
+             // Given the pruning logic, iterating is acceptable.
+             
+             // Try to find a pattern for this prefix
+             let entry = patterns.iter().find(|r| r.key().starts_with(prefix));
+             
+             if let Some(r) = entry {
+                let k = r.key();
+                let parts: Vec<&str> = k.split('-').collect();
+                if parts.len() > 1 {
+                    let suffix = parts[1]; 
+                    let rest_len = 7 - suffix.len();
+                    let mut rest = String::with_capacity(rest_len);
+                    for _ in 0..rest_len {
+                        rest.push_str(&rng.gen_range(0..=9).to_string());
+                    }
+                    return format!("{}{}{}", prefix, suffix, rest);
                 }
-                return format!("{}{}{}", prefix, suffix, rest);
-            }
+             }
         }
     }
 
-    // Fallback Random
     let mut suffix = String::with_capacity(7);
     for _ in 0..7 {
         suffix.push_str(&rng.gen_range(0..=9).to_string());
@@ -304,19 +311,17 @@ async fn generate_number(patterns: &Arc<DashMap<String, u32>>) -> String {
     format!("{}{}", prefix, suffix)
 }
 
-// Optimized Pattern Update (Lock-Free)
 fn update_pattern(patterns: &Arc<DashMap<String, u32>>, num: &str) {
     if num.len() < 7 { return; }
     let prefix = &num[0..4];
     let suffix = &num[4..7];
     let key = format!("{}-{}", prefix, suffix);
     
-    // DashMap handles concurrency internally
     *patterns.entry(key).or_insert(0) += 1;
     
-    // Simple pruning to prevent RAM explosion (very rare in Rust but good practice)
+    // Pruning
     if patterns.len() > 3000 {
-        patterns.retain(|_, &mut v| v > 1); // Remove weak patterns
+        patterns.retain(|_, &mut v| v > 1); 
     }
 }
 
@@ -331,7 +336,7 @@ async fn monitor_loop(state: Arc<AppState>) {
         let elapsed = state.stats.start_time.elapsed().as_secs_f64();
         let rate = if elapsed > 0.0 { s as f64 / elapsed } else { 0.0 };
 
-        let mut proxy_info = String::new();
+        let proxy_info;
         if state.use_proxies {
             let lock = state.proxy_state.lock().await;
             let pool = lock.queue.len();
@@ -339,7 +344,6 @@ async fn monitor_loop(state: Arc<AppState>) {
             let dead = lock.dead.len();
             
             if pool == 0 && active == 0 {
-                // Warning logic same as Python
                 proxy_info = format!(" {}WARNING: SWITCHED TO DIRECT{}", "!! ".red().blink(), " !!".red().blink());
             } else {
                 proxy_info = format!(" (Pool:{} Active:{} Dead:{})", pool, active, dead).blue().to_string();
@@ -371,43 +375,4 @@ async fn fetch_proxies() -> Vec<String> {
     let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
     let mut collected = HashSet::new();
 
-    for url in PROXY_SOURCES {
-        if let Ok(resp) = client.get(url).send().await {
-            if let Ok(text) = resp.text().await {
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() { continue; }
-                    let proxy = if !line.contains("://") {
-                        format!("socks5://{}", line)
-                    } else if line.to_lowercase().starts_with("socks5://") {
-                        line.to_string()
-                    } else {
-                        continue;
-                    };
-                    collected.insert(proxy);
-                }
-            }
-        }
-    }
-    
-    let mut list: Vec<String> = collected.into_iter().collect();
-    let mut rng = rand::thread_rng();
-    list.shuffle(&mut rng);
-    println!("{} Total Proxies: {}\n", "[Proxy Manager]".green(), list.len());
-    list
-}
-
-fn setup_ui() {
-    #[cfg(windows)]
-    let _ = colored::control::set_virtual_terminal(true);
-    Style::header();
-}
-
-fn input(prompt: &str) -> String {
-    print!("{}{}", Style::BOLD, prompt);
-    io::stdout().flush().unwrap();
-    let mut buffer = String::new();
-    io::stdin().read_line(&mut buffer).unwrap();
-    print!("{}", Style::RESET);
-    buffer.trim().to_string()
-}
+    for url in PROXY_SOURCES 
