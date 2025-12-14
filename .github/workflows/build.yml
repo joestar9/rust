@@ -1,0 +1,26 @@
+name: Build Windows EXE
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+        
+    - name: Build Release
+      run: cargo build --release
+      
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: irancell_bot_exe
+        path: target/release/irancell_bot.exe
