@@ -26,7 +26,6 @@ const API_NOTIFY: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/noti
 
 // --- EXACT PYTHON HEADERS COPY ---
 const APP_VERSION: &str = "9.62.0";
-// کپی دقیق از اسکریپت پایتون شما (حتی اگر نسخه فایرفاکس عجیب باشد، ما کپی می‌کنیم)
 const PYTHON_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0";
 const CONFIG_FILE: &str = "config.json";
 
@@ -115,9 +114,9 @@ async fn main() -> Result<()> {
     let _ = stdout.execute(terminal::Clear(terminal::ClearType::All));
     let _ = stdout.execute(crossterm::cursor::MoveTo(0, 0));
     
-    println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║    IRANCELL BOT - CLONED LOGIC (PYTHON MATCHED)               ║".cyan().bold());
-    println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
+    println!("{}", "╔═══════════════════════════════════════╗".cyan().bold());
+    println!("{}", "║       --Irancell Referral Bot--       ║".cyan().bold());
+    println!("{}", "╚═══════════════════════════════════════╝".cyan().bold());
 
     let (token, cookie) = load_config();
     if token.trim().is_empty() {
@@ -245,7 +244,7 @@ async fn logger_loop(mut rx: mpsc::Receiver<LogEvent>, stats: Arc<GlobalStats>) 
             let elapsed = start.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 { s as f64 / elapsed } else { 0.0 };
 
-            let title = format!("Irancell Bot | Sent: {} | Invalid: {} | NetRetry: {} | Rate: {:.1}/s", 
+            let title = format!("IRB | Sent: {} | Invalid: {} | NetRetry: {} | Rate: {:.1}/s", 
                 s, lf, pf + nf, rate);
             
             let _ = stdout.execute(terminal::SetTitle(title));
