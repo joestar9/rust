@@ -1,6 +1,6 @@
 [package]
 name = "irancell_bot"
-version = "5.1.0"
+version = "6.0.0"
 edition = "2021"
 
 [dependencies]
@@ -16,4 +16,3 @@ anyhow = "1.0"
 once_cell = "1.19"
 chrono = "0.4"
 futures = "0.3"
-
