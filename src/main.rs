@@ -21,14 +21,12 @@ use tokio::time::sleep;
 // ==========================================
 //      تنظیمات هارد کد (HARDCODED AUTH)
 // ==========================================
-// اگر اینجا را پر کنید، برنامه مستقیم اجرا می‌شود
 const FIXED_TOKEN: &str = "";
 const FIXED_COOKIE: &str = "";
 // ==========================================
 
 const API_URL: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 
-// User-Agent Rotation (More Human-like)
 const USER_AGENTS: [&str; 4] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -84,12 +82,12 @@ struct AppState {
 // --- UI Logic ---
 fn setup_terminal() {
     let mut stdout = io::stdout();
-    let _ = stdout.execute(terminal::SetTitle("Irancell Pro - Enterprise Edition"));
+    let _ = stdout.execute(terminal::SetTitle("Irancell Bot - Rust Edition"));
     let _ = stdout.execute(Clear(ClearType::All));
     let _ = stdout.execute(cursor::MoveTo(0, 0));
     
     println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║    IRANCELL PRO - ENGINEERED FOR STABILITY & SPEED            ║".cyan().bold());
+    println!("{}", "║    IRANCELL BOT - STABLE & FAST (FIXED BUILD)                 ║".cyan().bold());
     println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
 }
 
@@ -121,8 +119,8 @@ async fn main() -> Result<()> {
     };
 
     let limit: usize = input("Enter Limit (e.g., 20000): ").parse().unwrap_or(100000);
-    let worker_count: usize = input("Number of Proxy Managers (Workers) (default 50): ").parse().unwrap_or(50);
-    let concurrency: usize = input("Concurrency per Manager (Requests/Connection) (default 5): ").parse().unwrap_or(5);
+    let worker_count: usize = input("Number of Proxy Managers (default 50): ").parse().unwrap_or(50);
+    let concurrency: usize = input("Concurrency per Manager (default 5): ").parse().unwrap_or(5);
     let use_proxies = input("Use Auto-Proxy List? (y/n): ").to_lowercase() == "y";
 
     // --- SETUP ---
@@ -174,35 +172,29 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The Manager is responsible for holding ONE proxy connection 
-/// and multiplexing multiple requests through it.
 async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
     let mut current_proxy: Option<String> = None;
     let mut client: Option<Client> = None;
     let mut forced_direct = false;
-    let mut consecutive_net_fails = 0;
 
-    // Use a Semaphore to control "In-Flight" requests for this specific proxy connection
+    // Use a Semaphore to control "In-Flight" requests
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
     loop {
-        // Global Stop Check
         if !state.stats.is_running.load(Ordering::Relaxed) { break; }
         if state.stats.success.load(Ordering::Relaxed) >= state.stats.limit {
             state.stats.is_running.store(false, Ordering::Relaxed);
             break;
         }
 
-        // --- 1. PROXY ACQUISITION (Exclusive) ---
+        // --- 1. PROXY ACQUISITION ---
         if state.use_proxies {
             if current_proxy.is_none() && !forced_direct {
                 let mut lock = state.proxy_state.lock();
                 if let Some(p) = lock.queue.pop_front() {
-                    // We own this proxy now. No one else has it.
                     lock.active.insert(p.clone());
                     current_proxy = Some(p);
-                    consecutive_net_fails = 0;
-                    client = None; // Force rebuild
+                    client = None; 
                 } else if lock.active.is_empty() {
                     forced_direct = true;
                     client = None;
@@ -210,12 +202,12 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             }
         }
 
-        // --- 2. CLIENT OPTIMIZATION (Keep-Alive) ---
+        // --- 2. CLIENT OPTIMIZATION ---
         if client.is_none() {
             let mut builder = Client::builder()
-                .timeout(Duration::from_secs(12)) // Slightly higher for handshake
-                .tcp_nodelay(true) // Disable Nagle's alg for speed
-                .pool_idle_timeout(Duration::from_secs(45)) // Keep connection open
+                .timeout(Duration::from_secs(12))
+                .tcp_nodelay(true)
+                .pool_idle_timeout(Duration::from_secs(45))
                 .pool_max_idle_per_host(concurrency) 
                 .user_agent(*USER_AGENTS.choose(&mut rand::thread_rng()).unwrap())
                 .danger_accept_invalid_certs(true);
@@ -229,7 +221,6 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             match builder.build() {
                 Ok(c) => client = Some(c),
                 Err(_) => {
-                    // Proxy is likely junk, drop it immediately
                     if let Some(dead) = current_proxy.take() {
                         let mut lock = state.proxy_state.lock();
                         lock.active.remove(&dead);
@@ -242,29 +233,23 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
         }
 
         // --- 3. PIPELINE REQUESTS ---
-        // We wait for a "slot" to open up.
-        // `acquire_owned` ensures that if this loop is fast, we don't spawn infinite tasks.
-        // We only spawn if we have capacity in our concurrency limit.
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => break, 
         };
 
-        // Clone for task
         let cli = client.as_ref().unwrap().clone();
         let state_ref = state.clone();
         let num = generate_number(&state.patterns);
-        
         let is_proxy = state.use_proxies && !forced_direct;
 
-        // --- SPAWN DETACHED TASK ---
         tokio::spawn(async move {
             let payload = ReferralPayload {
                 application_name: "NGMI",
                 friend_number: format!("98{}", &num[1..]),
             };
 
-            // Pre-computed static headers logic manually inserted for speed
+            // Manual Header Construction for Speed (Avoids HeaderMap clone overhead)
             let res = cli.post(API_URL)
                 .header("Authorization", &state_ref.token)
                 .header("Cookie", &state_ref.cookie)
@@ -275,14 +260,11 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
                 .send()
                 .await;
 
-            // Handle Result & Stats
             match res {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         state_ref.stats.success.fetch_add(1, Ordering::Relaxed);
                         update_pattern(&state_ref.patterns, &num);
-                        // Success resets strikes? Not easily possible in detached task without Arc Mutex.
-                        // We rely on "Survivor Bias" - good proxies stay alive.
                     } else {
                         state_ref.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
                     }
@@ -295,32 +277,14 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
                     }
                 }
             }
-            drop(permit); // Release slot
+            drop(permit); 
         });
-
-        // --- 4. HEALTH CHECK (Simplified) ---
-        // If we fired requests, we don't wait for them. We loop back to fire more.
-        // BUT, if the proxy is dead, all those tasks will fail.
-        // To detect death cleanly in "Main Loop", we can check if `client` threw error on build (handled).
-        // Handling "3 strikes" inside detached tasks is complex. 
-        // Instead, we implement a "Time-To-Live" or "Rotation" strategy if efficiency drops?
-        // NO, keep it simple: If proxy fails to connect (caught in builder), it dies.
-        // If it connects but times out (in task), we just count fails. 
-        // Realistically, dead proxies fail fast.
-        
-        // Anti-CPU-Burn Sleep (Tiny)
-        // If semaphore is full, `acquire` waits efficiently. 
-        // If semaphore is free, we loop fast. 
-        // To be "Elegant", we limit loop speed slightly if queue is empty.
     }
 }
 
-// Ultra-fast Generator
 fn generate_number(patterns: &DashMap<String, u32>) -> String {
     let mut rng = rand::thread_rng();
     let prefix = PREFIXES.choose(&mut rng).unwrap();
-    
-    // Minimal overhead logic
     let mut suffix = String::with_capacity(7);
     for _ in 0..7 {
         suffix.push_str(&rng.gen_range(0..=9).to_string().as_str());
@@ -333,9 +297,7 @@ fn update_pattern(patterns: &DashMap<String, u32>, num: &str) {
     let prefix = &num[0..4];
     let suffix = &num[4..7];
     let key = format!("{}-{}", prefix, suffix);
-    // Use low-contention insert
     *patterns.entry(key).or_insert(0) += 1;
-    // Periodic Cleanup (1 in 1000 chance)
     if rand::thread_rng().gen_bool(0.001) && patterns.len() > 3000 {
         patterns.retain(|_, v| *v > 1);
     }
