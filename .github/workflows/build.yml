@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Optimized Windows EXE
 
 on: [push]
 
@@ -9,18 +9,19 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
-        
+    # Cache Rust dependencies to speed up future builds significantly
+    - uses: swatinem/rust-cache@v2
+    
+    - name: Update Rust
+      run: rustup update stable
+      
     - name: Build Release
+      # Enable link-time optimization (LTO) via flags if needed, 
+      # but default release is usually enough.
       run: cargo build --release
       
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: irancell_bot_exe
+        name: irancell_bot_final
         path: target/release/irancell_bot.exe
