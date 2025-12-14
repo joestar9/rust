@@ -1,11 +1,23 @@
-name: Build Optimized Windows EXE
+name: Build Multi-Platform
 
 on: [workflow_dispatch]
 
 jobs:
   build:
-    runs-on: windows-latest
-    
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: irancell_bot_windows.exe
+            binary_path: target/release/irancell_bot.exe
+          
+          - os: ubuntu-latest
+            artifact_name: irancell_bot_linux
+            binary_path: target/release/irancell_bot
+
     steps:
     - uses: actions/checkout@v4
     
@@ -13,12 +25,18 @@ jobs:
     
     - name: Update Rust
       run: rustup update stable
-      
+
+    - name: Install Linux Dependencies
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev pkg-config
+
     - name: Build Release
       run: cargo build --release
       
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: irancell_bot_manual
-        path: target/release/irancell_bot.exe
+        name: ${{ matrix.artifact_name }}
+        path: ${{ matrix.binary_path }}
