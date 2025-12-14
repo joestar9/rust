@@ -20,13 +20,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::time::sleep;
 
-// --- API ENDPOINTS (Two-Step) ---
+// --- API ENDPOINTS ---
 const API_CHECK: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_NOTIFY: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
 
-// --- CRITICAL HEADERS ---
+// --- EXACT PYTHON HEADERS COPY ---
 const APP_VERSION: &str = "9.62.0";
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0";
+// کپی دقیق از اسکریپت پایتون شما (حتی اگر نسخه فایرفاکس عجیب باشد، ما کپی می‌کنیم)
+const PYTHON_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0";
 const CONFIG_FILE: &str = "config.json";
 
 const PREFIXES: [&str; 14] = [
@@ -46,7 +47,7 @@ const PROXY_SOURCES: [&str; 6] = [
 #[derive(Deserialize)]
 struct ConfigFile {
     token: String,
-    cookie: String, // Kept for compatibility, though Python script relies mainly on Token
+    cookie: String,
 }
 
 #[derive(Serialize)]
@@ -76,7 +77,9 @@ struct AppState {
     proxy_state: Arc<Mutex<ProxyState>>,
     patterns: Arc<DashMap<String, u32>>,
     token: String,
+    cookie: String, // Added Cookie to AppState
     use_proxies: bool,
+    base_headers: header::HeaderMap,
     log_tx: mpsc::Sender<LogEvent>,
 }
 
@@ -102,7 +105,7 @@ fn load_config() -> (String, String) {
         }
     }
     let token = input("Enter Authorization Token (Bearer ...): ");
-    let cookie = input("Enter Cookie (Optional/Enter to skip): ");
+    let cookie = input("Enter Cookie (Optional): ");
     (token, cookie)
 }
 
@@ -113,7 +116,7 @@ async fn main() -> Result<()> {
     let _ = stdout.execute(crossterm::cursor::MoveTo(0, 0));
     
     println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║    IRANCELL PRO - 2-STEP VERIFICATION (LEGAL METHOD)          ║".cyan().bold());
+    println!("{}", "║    IRANCELL BOT - CLONED LOGIC (PYTHON MATCHED)               ║".cyan().bold());
     println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
 
     let (token, cookie) = load_config();
@@ -137,6 +140,23 @@ async fn main() -> Result<()> {
         }
     }
 
+    // --- HEADERS (MATCHING PYTHON EXACTLY) ---
+    let mut headers = header::HeaderMap::new();
+    // Python sends these exact headers:
+    headers.insert("Authorization", header::HeaderValue::from_str(&token).unwrap_or(header::HeaderValue::from_static("")));
+    // Note: Cookie is optional in Python script input but if provided it should be sent
+    if !cookie.trim().is_empty() {
+        headers.insert("Cookie", header::HeaderValue::from_str(&cookie).unwrap_or(header::HeaderValue::from_static("")));
+    }
+    headers.insert("User-Agent", header::HeaderValue::from_static(PYTHON_USER_AGENT));
+    headers.insert("Origin", header::HeaderValue::from_static("https://my.irancell.ir"));
+    headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
+    headers.insert("Accept", header::HeaderValue::from_static("application/json, text/plain, */*"));
+    headers.insert("Accept-Language", header::HeaderValue::from_static("fa"));
+    // CRITICAL: Python aiohttp sends this by default, we must mimic it:
+    headers.insert("Accept-Encoding", header::HeaderValue::from_static("gzip, deflate, br, zstd"));
+    headers.insert("x-app-version", header::HeaderValue::from_static(APP_VERSION));
+
     let (log_tx, log_rx) = mpsc::channel(1000);
 
     let stats = Arc::new(GlobalStats {
@@ -158,11 +178,13 @@ async fn main() -> Result<()> {
         })),
         patterns: Arc::new(DashMap::with_capacity(5000)),
         token,
+        cookie,
         use_proxies,
+        base_headers: headers,
         log_tx,
     });
 
-    println!("\n{} Starting {} Managers (2-Step Logic)...", ">>>".green(), worker_count);
+    println!("\n{} Starting {} Managers...", ">>>".green(), worker_count);
     
     tokio::spawn(logger_loop(log_rx, stats.clone()));
 
@@ -246,6 +268,7 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             break;
         }
 
+        // --- PROXY LOGIC ---
         if state.use_proxies {
             if current_proxy.is_none() && !forced_direct {
                 let mut lock = state.proxy_state.lock();
@@ -260,13 +283,17 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             }
         }
 
+        // --- CLIENT BUILD (Exactly matching Python capabilities) ---
         if client.is_none() {
             let mut builder = Client::builder()
                 .timeout(Duration::from_secs(12))
                 .connect_timeout(Duration::from_secs(5))
                 .http1_only()
                 .tcp_nodelay(true)
-                .danger_accept_invalid_certs(true);
+                .danger_accept_invalid_certs(true)
+                // Rust reqwest adds gzip/brotli auto support, mimicking aiohttp
+                .brotli(true)
+                .gzip(true);
 
             if let Some(ref p_url) = current_proxy {
                 if let Ok(proxy) = Proxy::all(p_url) {
@@ -310,92 +337,88 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
                 "friend_number": format!("98{}", &num_to_process[1..])
             });
 
-            // --- STEP 1: CHECK (Referer: /invite) ---
+            // --- STEP 1: CHECK (/invite) ---
+            // Creating a new Request Builder to override Referer specifically
+            let mut headers_step1 = state_ref.base_headers.clone();
+            headers_step1.insert("Referer", header::HeaderValue::from_static("https://my.irancell.ir/invite"));
+
             let res1 = cli.post(API_CHECK)
-                .header("Authorization", &state_ref.token)
-                .header("User-Agent", USER_AGENT)
-                .header("Origin", "https://my.irancell.ir")
-                .header("Referer", "https://my.irancell.ir/invite") // Referer 1
-                .header("Content-Type", "application/json")
-                .header("x-app-version", APP_VERSION) // Essential
-                .header("Accept", "application/json, text/plain, */*")
-                .header("Accept-Language", "fa")
+                .headers(headers_step1)
                 .json(&payload)
                 .send()
                 .await;
 
             match res1 {
                 Ok(resp1) => {
-                    if resp1.status() == StatusCode::UNAUTHORIZED {
+                    // Python Logic: Check 200 AND message == "done"
+                    if resp1.status().is_success() {
+                        // Safe parsing
+                        let text1 = resp1.text().await.unwrap_or_default();
+                        let json1: Option<Value> = serde_json::from_str(&text1).ok();
+                        
+                        let is_done1 = json1.as_ref()
+                            .and_then(|j| j.get("message"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s == "done")
+                            .unwrap_or(false);
+
+                        if is_done1 {
+                            // --- STEP 2: NOTIFY (/invite/confirm) ---
+                            let mut headers_step2 = state_ref.base_headers.clone();
+                            headers_step2.insert("Referer", header::HeaderValue::from_static("https://my.irancell.ir/invite/confirm"));
+
+                            let res2 = cli.post(API_NOTIFY)
+                                .headers(headers_step2)
+                                .json(&payload)
+                                .send()
+                                .await;
+
+                            match res2 {
+                                Ok(resp2) => {
+                                    let text2 = resp2.text().await.unwrap_or_default();
+                                    let json2: Option<Value> = serde_json::from_str(&text2).ok();
+                                    let is_done2 = json2.as_ref()
+                                        .and_then(|j| j.get("message"))
+                                        .and_then(|m| m.as_str())
+                                        .map(|s| s == "done")
+                                        .unwrap_or(false);
+
+                                    if is_done2 {
+                                        state_ref.stats.success.fetch_add(1, Ordering::Relaxed);
+                                        update_pattern(&state_ref.patterns, &num_to_process);
+                                        let _ = state_ref.log_tx.send(LogEvent::Success { num: num_to_process, proxy: proxy_addr_str }).await;
+                                    } else {
+                                        // Logic Fail Step 2
+                                        state_ref.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
+                                        let _ = state_ref.log_tx.send(LogEvent::LogicFail { num: num_to_process, reason: "S2 Fail".to_string() }).await;
+                                    }
+                                }
+                                Err(_) => {
+                                    // Net Fail Step 2 -> Retry
+                                    if is_proxy { state_ref.stats.proxy_fail.fetch_add(1, Ordering::Relaxed); }
+                                    else { state_ref.stats.net_fail.fetch_add(1, Ordering::Relaxed); }
+                                    let _ = retry_tx_clone.send(num_to_process).await;
+                                }
+                            }
+                        } else {
+                            // Logic Fail Step 1 (e.g. limit reached, bad number)
+                            state_ref.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
+                            // We do NOT retry logic fails.
+                            let _ = state_ref.log_tx.send(LogEvent::LogicFail { num: num_to_process, reason: "S1 Fail".to_string() }).await;
+                        }
+                    } else if resp1.status() == StatusCode::UNAUTHORIZED {
                         if state_ref.stats.is_running.swap(false, Ordering::Relaxed) {
                             let _ = state_ref.log_tx.send(LogEvent::TokenDead).await;
                         }
-                        drop(permit); return;
-                    }
-
-                    // Check JSON Content for "message": "done"
-                    let text1 = resp1.text().await.unwrap_or_default();
-                    let json1: Option<Value> = serde_json::from_str(&text1).ok();
-                    let is_done1 = json1.as_ref()
-                        .and_then(|j| j.get("message"))
-                        .and_then(|m| m.as_str())
-                        .map(|s| s == "done")
-                        .unwrap_or(false);
-
-                    if is_done1 {
-                        // --- STEP 2: NOTIFY (Referer: /invite/confirm) ---
-                        // Only if step 1 is "done"
-                        let res2 = cli.post(API_NOTIFY)
-                            .header("Authorization", &state_ref.token)
-                            .header("User-Agent", USER_AGENT)
-                            .header("Origin", "https://my.irancell.ir")
-                            .header("Referer", "https://my.irancell.ir/invite/confirm") // Referer 2
-                            .header("Content-Type", "application/json")
-                            .header("x-app-version", APP_VERSION)
-                            .header("Accept", "application/json, text/plain, */*")
-                            .header("Accept-Language", "fa")
-                            .json(&payload)
-                            .send()
-                            .await;
-
-                        match res2 {
-                            Ok(resp2) => {
-                                let text2 = resp2.text().await.unwrap_or_default();
-                                let json2: Option<Value> = serde_json::from_str(&text2).ok();
-                                let is_done2 = json2.as_ref()
-                                    .and_then(|j| j.get("message"))
-                                    .and_then(|m| m.as_str())
-                                    .map(|s| s == "done")
-                                    .unwrap_or(false);
-
-                                if is_done2 {
-                                    // SUCCESS! (Both steps passed)
-                                    state_ref.stats.success.fetch_add(1, Ordering::Relaxed);
-                                    update_pattern(&state_ref.patterns, &num_to_process);
-                                    let _ = state_ref.log_tx.send(LogEvent::Success { num: num_to_process, proxy: proxy_addr_str }).await;
-                                } else {
-                                    // Step 2 Logic Fail
-                                    state_ref.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
-                                    let _ = state_ref.log_tx.send(LogEvent::LogicFail { num: num_to_process, reason: "Step2 Fail".to_string() }).await;
-                                }
-                            }
-                            Err(_) => {
-                                // Step 2 Net Fail -> Retry
-                                if is_proxy { state_ref.stats.proxy_fail.fetch_add(1, Ordering::Relaxed); } 
-                                else { state_ref.stats.net_fail.fetch_add(1, Ordering::Relaxed); }
-                                let _ = retry_tx_clone.send(num_to_process).await;
-                            }
-                        }
                     } else {
-                        // Step 1 Logic Fail (Invalid number or not eligible)
+                        // Other Logic Fails (400, 500, etc)
                         state_ref.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
-                        // Optional: Parse error message from json1
-                        let _ = state_ref.log_tx.send(LogEvent::LogicFail { num: num_to_process, reason: "Step1 Fail".to_string() }).await;
+                        let _ = state_ref.log_tx.send(LogEvent::LogicFail { num: num_to_process, reason: resp1.status().to_string() }).await;
                     }
                 }
                 Err(_) => {
-                    // Step 1 Net Fail -> Retry
-                    if is_proxy { state_ref.stats.proxy_fail.fetch_add(1, Ordering::Relaxed); } 
+                    // Net Fail Step 1 -> Retry
+                    if is_proxy { state_ref.stats.proxy_fail.fetch_add(1, Ordering::Relaxed); }
                     else { state_ref.stats.net_fail.fetch_add(1, Ordering::Relaxed); }
                     let _ = retry_tx_clone.send(num_to_process).await;
                 }
