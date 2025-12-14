@@ -36,8 +36,6 @@ const PROXY_SOURCES: [&str; 6] = [
     "https://raw.githubusercontent.com/trio666/proxy-checker/refs/heads/main/socks5.txt"
 ];
 
-// --- Structs ---
-
 #[derive(Deserialize)]
 struct ConfigFile {
     token: String,
@@ -53,7 +51,8 @@ struct ReferralPayload<'a> {
 struct GlobalStats {
     success: AtomicUsize,
     logic_fail: AtomicUsize,
-    proxy_fail: AtomicUsize,
+    // We keep these for internal stats, but won't spam logs
+    proxy_fail: AtomicUsize, 
     net_fail: AtomicUsize,
     limit: usize,
     start_time: Instant,
@@ -74,18 +73,14 @@ struct AppState {
     cookie: String,
     use_proxies: bool,
     base_headers: header::HeaderMap,
-    log_tx: mpsc::Sender<LogEvent>, // Channel for live logs
+    log_tx: mpsc::Sender<LogEvent>,
 }
 
-// Enum for Live Logs
 enum LogEvent {
     Success { num: String, proxy: String },
     LogicFail { num: String, status: String },
-    NetFail { num: String, error: String, is_proxy: bool },
-    Info(String),
+    // NetFail removed from logs to keep it clean, only internal stats updated
 }
-
-// --- Helper Functions ---
 
 fn input(prompt: &str) -> String {
     print!("{}{}", prompt.bold(), crossterm::style::Attribute::Reset);
@@ -102,8 +97,6 @@ fn load_config() -> (String, String) {
             return (conf.token, conf.cookie);
         }
     }
-    
-    // Fallback to manual input
     let token = input("Enter Authorization Token (Bearer ...): ");
     let cookie = input("Enter Cookie: ");
     (token, cookie)
@@ -111,16 +104,14 @@ fn load_config() -> (String, String) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Clear screen
     let mut stdout = io::stdout();
     let _ = stdout.execute(terminal::Clear(terminal::ClearType::All));
     let _ = stdout.execute(crossterm::cursor::MoveTo(0, 0));
     
     println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║    IRANCELL BOT - LIVE LOGGING & CONFIG EDITION               ║".cyan().bold());
+    println!("{}", "║    IRANCELL BOT - PERSISTENT RETRY & CLEAN LOGS               ║".cyan().bold());
     println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
 
-    // --- CONFIG LOAD ---
     let (token, cookie) = load_config();
     if token.trim().is_empty() || cookie.trim().is_empty() {
         println!("{}", "Error: Token and Cookie are required.".red());
@@ -132,7 +123,6 @@ async fn main() -> Result<()> {
     let concurrency: usize = input("Concurrency (default 5): ").parse().unwrap_or(5);
     let use_proxies = input("Use Auto-Proxy List? (y/n): ").to_lowercase() == "y";
 
-    // --- PROXY SETUP ---
     let mut initial_queue = VecDeque::new();
     if use_proxies {
         let list = fetch_proxies().await;
@@ -143,7 +133,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // --- HEADERS ---
     let mut headers = header::HeaderMap::new();
     headers.insert("Authorization", header::HeaderValue::from_str(&token).unwrap_or(header::HeaderValue::from_static("")));
     headers.insert("Cookie", header::HeaderValue::from_str(&cookie).unwrap_or(header::HeaderValue::from_static("")));
@@ -154,8 +143,6 @@ async fn main() -> Result<()> {
     headers.insert("Accept", header::HeaderValue::from_static("application/json, text/plain, */*"));
     headers.insert("Accept-Language", header::HeaderValue::from_static("fa"));
 
-    // --- LOG CHANNEL ---
-    // Increase channel buffer to prevent blocking workers if logging is slow
     let (log_tx, log_rx) = mpsc::channel(1000);
 
     let stats = Arc::new(GlobalStats {
@@ -185,10 +172,8 @@ async fn main() -> Result<()> {
 
     println!("\n{} Starting {} Managers...", ">>>".green(), worker_count);
     
-    // Spawn Log Printer
     tokio::spawn(logger_loop(log_rx, stats.clone()));
 
-    // Spawn Workers
     for _ in 0..worker_count {
         let state = app_state.clone();
         tokio::spawn(async move {
@@ -196,7 +181,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Keep main alive
     while stats.is_running.load(Ordering::Relaxed) {
         sleep(Duration::from_secs(1)).await;
     }
@@ -230,22 +214,8 @@ async fn logger_loop(mut rx: mpsc::Receiver<LogEvent>, stats: Arc<GlobalStats>) 
                     status
                 );
             },
-            LogEvent::NetFail { num, error, is_proxy } => {
-                // Determine label based on context
-                let label = if is_proxy { "[PROXY-ERR]".yellow() } else { "[NET-ERR]".magenta() };
-                let _ = writeln!(stdout, "{} {} {} | {}", 
-                    format!("[{}]", now).dim(), 
-                    label, 
-                    num, 
-                    error
-                );
-            },
-            LogEvent::Info(msg) => {
-                let _ = writeln!(stdout, "{} {}", format!("[{}]", now).dim(), msg.blue());
-            }
         }
 
-        // Update Title Bar every 500ms (to avoid syscall spam)
         if last_title_update.elapsed().as_millis() > 500 {
             let s = stats.success.load(Ordering::Relaxed);
             let lf = stats.logic_fail.load(Ordering::Relaxed);
@@ -254,8 +224,8 @@ async fn logger_loop(mut rx: mpsc::Receiver<LogEvent>, stats: Arc<GlobalStats>) 
             let elapsed = start.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 { s as f64 / elapsed } else { 0.0 };
 
-            let title = format!("Irancell Bot | OK: {} | Fail: {} | ProxyErr: {} | Rate: {:.1}/s", 
-                s, lf + nf, pf, rate);
+            let title = format!("Irancell Bot | OK: {} | Fail: {} | Retry/Net: {} | Rate: {:.1}/s", 
+                s, lf, pf + nf, rate);
             
             let _ = stdout.execute(terminal::SetTitle(title));
             last_title_update = Instant::now();
@@ -268,6 +238,10 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
     let mut client: Option<Client> = None;
     let mut forced_direct = false;
     let semaphore = Arc::new(Semaphore::new(concurrency));
+    
+    // RETRY QUEUE: Numbers that failed network and need retrying
+    // This channel allows workers to send failed numbers back to the manager
+    let (retry_tx, mut retry_rx) = mpsc::channel::<String>(concurrency * 2);
 
     loop {
         if !state.stats.is_running.load(Ordering::Relaxed) { break; }
@@ -276,7 +250,7 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             break;
         }
 
-        // --- Proxy Acquisition ---
+        // --- Proxy Management ---
         if state.use_proxies {
             if current_proxy.is_none() && !forced_direct {
                 let mut lock = state.proxy_state.lock();
@@ -307,34 +281,42 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             match builder.build() {
                 Ok(c) => client = Some(c),
                 Err(_) => {
-                    // Proxy dead on build
+                    // Proxy dead on build, drop it
                     if let Some(dead) = current_proxy.take() {
                         let mut lock = state.proxy_state.lock();
                         lock.active.remove(&dead);
                         lock.dead.insert(dead);
                     }
-                    sleep(Duration::from_secs(1)).await;
+                    // If we have retries pending, we should sleep a bit to avoid hot loop
+                    sleep(Duration::from_millis(500)).await;
                     continue;
                 }
             }
         }
 
-        // --- Request Execution ---
+        // --- Acquire Slot ---
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => break, 
         };
 
+        // --- Decide Number (New or Retry) ---
+        // Priority: Retry Queue > New Number
+        let num_to_process = match retry_rx.try_recv() {
+            Ok(n) => n, // We have a failed number to retry!
+            Err(_) => generate_number(&state.patterns) // Generate fresh
+        };
+
         let cli = client.as_ref().unwrap().clone();
         let state_ref = state.clone();
-        let num = generate_number(&state.patterns);
         let proxy_addr_str = current_proxy.clone().unwrap_or_default();
         let is_proxy = state.use_proxies && !forced_direct;
+        let retry_tx_clone = retry_tx.clone();
 
         tokio::spawn(async move {
             let payload = serde_json::json!({
                 "application_name": "NGMI",
-                "friend_number": format!("98{}", &num[1..])
+                "friend_number": format!("98{}", &num_to_process[1..])
             });
 
             let res = cli.post(API_URL)
@@ -346,32 +328,34 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             match res {
                 Ok(resp) => {
                     if resp.status().is_success() {
+                        // FINAL SUCCESS
                         state_ref.stats.success.fetch_add(1, Ordering::Relaxed);
-                        update_pattern(&state_ref.patterns, &num);
-                        // Log Success
-                        let _ = state_ref.log_tx.send(LogEvent::Success { num, proxy: proxy_addr_str }).await;
+                        update_pattern(&state_ref.patterns, &num_to_process);
+                        let _ = state_ref.log_tx.send(LogEvent::Success { num: num_to_process, proxy: proxy_addr_str }).await;
                     } else {
+                        // FINAL LOGIC FAIL (e.g., 400 Bad Request, 500 Server Error)
+                        // We do NOT retry logic fails (usually means invalid number or already invited)
                         state_ref.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
-                        // Log Fail
                         let _ = state_ref.log_tx.send(LogEvent::LogicFail { 
-                            num, 
+                            num: num_to_process, 
                             status: resp.status().as_u16().to_string() 
                         }).await;
                     }
                 }
-                Err(e) => {
+                Err(_) => {
+                    // NETWORK ERROR -> RETRY
                     if is_proxy {
                         state_ref.stats.proxy_fail.fetch_add(1, Ordering::Relaxed);
                     } else {
                         state_ref.stats.net_fail.fetch_add(1, Ordering::Relaxed);
                     }
-                    // Log Error
-                    let error_msg = if e.is_timeout() { "Timeout".to_string() } else { "Conn Err".to_string() };
-                    let _ = state_ref.log_tx.send(LogEvent::NetFail { 
-                        num, 
-                        error: error_msg,
-                        is_proxy 
-                    }).await;
+                    
+                    // CRITICAL: We do NOT log this. We send it back to the queue.
+                    // The manager will pick it up and try again (possibly with a new proxy if the current one dies).
+                    let _ = retry_tx_clone.send(num_to_process).await;
+                    
+                    // Note: We don't mark proxy dead here directly to avoid lock contention.
+                    // We let the manager naturally rotate if connection errors pile up or client build fails.
                 }
             }
             drop(permit); 
@@ -401,6 +385,7 @@ fn update_pattern(patterns: &DashMap<String, u32>, num: &str) {
 }
 
 async fn fetch_proxies() -> Vec<String> {
+    println!("{}", "[Proxy Manager] Downloading proxies...".yellow());
     let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
     let mut collected = HashSet::new();
 
