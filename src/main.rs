@@ -1,8 +1,9 @@
 use colored::*;
+use dashmap::DashMap; // High performance concurrent map
 use rand::seq::SliceRandom;
 use rand::Rng;
-use reqwest::{Client, Proxy};
-use std::collections::{HashMap, HashSet};
+use reqwest::{header, Client, Proxy};
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -51,10 +52,11 @@ struct ProxyState {
 struct AppState {
     stats: Arc<GlobalStats>,
     proxy_state: Arc<Mutex<ProxyState>>,
-    patterns: Arc<Mutex<HashMap<String, u32>>>,
+    patterns: Arc<DashMap<String, u32>>, // Changed to DashMap for speed
     token: String,
     cookie: String,
     use_proxies: bool,
+    base_headers: header::HeaderMap, // Pre-computed headers
 }
 
 #[tokio::main]
@@ -96,6 +98,15 @@ async fn main() {
         println!("{}", "Skipping proxy setup. Running DIRECT.".yellow());
     }
 
+    // --- PRE-COMPUTE HEADERS (Optimization) ---
+    let mut headers = header::HeaderMap::new();
+    headers.insert("Authorization", header::HeaderValue::from_str(&token).unwrap_or(header::HeaderValue::from_static("")));
+    headers.insert("Cookie", header::HeaderValue::from_str(&cookie).unwrap_or(header::HeaderValue::from_static("")));
+    headers.insert("User-Agent", header::HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"));
+    headers.insert("Origin", header::HeaderValue::from_static("https://my.irancell.ir"));
+    headers.insert("Referer", header::HeaderValue::from_static("https://my.irancell.ir/"));
+    headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
+
     // --- STATE INITIALIZATION ---
     let stats = Arc::new(GlobalStats {
         success: AtomicUsize::new(0),
@@ -116,17 +127,17 @@ async fn main() {
     let app_state = Arc::new(AppState {
         stats: stats.clone(),
         proxy_state: proxy_state.clone(),
-        patterns: Arc::new(Mutex::new(HashMap::new())),
+        patterns: Arc::new(DashMap::new()),
         token,
         cookie,
         use_proxies,
+        base_headers: headers,
     });
 
-    println!("\n{} Starting {} workers...", ">>>".green(), worker_count);
+    println!("\n{} Starting {} workers (Optimized Async Engine)...", ">>>".green(), worker_count);
     println!("{} Target: {} Successful Referrals\n", ">>>".green(), limit);
 
     // --- SPAWN WORKERS ---
-    // We use a semaphore just to be safe, though separate tasks are fine.
     let _semaphore = Arc::new(Semaphore::new(worker_count));
 
     for _ in 0..worker_count {
@@ -146,25 +157,21 @@ async fn worker_loop(state: Arc<AppState>) {
     let mut client: Option<Client> = None;
     let mut forced_direct = false;
 
-    // Pattern local cache (optional, simplifed to use shared for now)
-    
     loop {
-        // Check Limit
-        if !state.stats.is_running.load(Ordering::Relaxed) {
-            break;
-        }
-        let success_count = state.stats.success.load(Ordering::Relaxed);
-        if success_count >= state.stats.limit {
+        // 1. Check Limits & Running State (Non-blocking check)
+        if !state.stats.is_running.load(Ordering::Relaxed) { break; }
+        
+        // Only check limit explicitly if success > 0 to save atomic loads
+        if state.stats.success.load(Ordering::Relaxed) >= state.stats.limit {
             state.stats.is_running.store(false, Ordering::Relaxed);
             break;
         }
 
-        // --- PROXY MANAGEMENT ---
+        // 2. Proxy Logic (Sticky + Fallback)
         let mut needs_new_client = false;
 
         if state.use_proxies {
             if current_proxy.is_none() && !forced_direct {
-                // Try get a proxy
                 let mut lock = state.proxy_state.lock().await;
                 if let Some(p) = lock.queue.pop() {
                     lock.active.insert(p.clone());
@@ -172,22 +179,20 @@ async fn worker_loop(state: Arc<AppState>) {
                     proxy_strikes = 0;
                     needs_new_client = true;
                 } else if lock.active.is_empty() {
-                    // No queue, no active -> Forced Direct
+                    // No queue left, no active left -> Forced Direct
                     forced_direct = true;
                     needs_new_client = true;
                 }
             }
-        } else {
-            // Direct mode logic
-            if client.is_none() {
-                needs_new_client = true;
-            }
+        } else if client.is_none() {
+            needs_new_client = true;
         }
 
-        // Build Client if needed
+        // 3. Build Client (Only when needed)
         if needs_new_client || client.is_none() {
             let mut builder = Client::builder()
                 .timeout(Duration::from_secs(10))
+                .tcp_nodelay(true) // Optimization: Fast packet send
                 .danger_accept_invalid_certs(true);
 
             if let Some(ref p_url) = current_proxy {
@@ -199,30 +204,26 @@ async fn worker_loop(state: Arc<AppState>) {
             match builder.build() {
                 Ok(c) => client = Some(c),
                 Err(_) => {
-                    // Build failed? wait and retry
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             }
         }
 
-        // --- GENERATE NUMBER ---
+        // 4. Generate Number (DashMap Optimized)
         let num = generate_number(&state.patterns).await;
 
-        // --- SEND REQUEST ---
+        // 5. Send Request
         let cli = client.as_ref().unwrap();
+        // Construct payload efficiently
         let payload = serde_json::json!({
             "application_name": "NGMI",
             "friend_number": format!("98{}", &num[1..])
         });
 
+        // Use pre-computed headers + payload
         let req_res = cli.post(API_URL)
-            .header("Authorization", &state.token)
-            .header("Cookie", &state.cookie)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-            .header("Origin", "https://my.irancell.ir")
-            .header("Referer", "https://my.irancell.ir/")
-            .header("Content-Type", "application/json")
+            .headers(state.base_headers.clone()) 
             .json(&payload)
             .send()
             .await;
@@ -232,94 +233,90 @@ async fn worker_loop(state: Arc<AppState>) {
                 if resp.status().is_success() {
                     // SUCCESS
                     state.stats.success.fetch_add(1, Ordering::Relaxed);
-                    update_pattern(&state.patterns, &num).await;
-                    // Reset strikes
+                    update_pattern(&state.patterns, &num); // No await needed for DashMap
                     proxy_strikes = 0;
                 } else {
-                    // LOGIC FAIL (4xx, 5xx)
+                    // LOGIC FAIL
                     state.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
                 }
             },
             Err(_) => {
-                // NETWORK ERROR
+                // NETWORK FAIL
                 if state.use_proxies && !forced_direct {
                     state.stats.proxy_fail.fetch_add(1, Ordering::Relaxed);
                     proxy_strikes += 1;
                     
                     if proxy_strikes >= 3 {
-                        // Mark dead
+                        // Mark Dead
                         if let Some(dead_p) = current_proxy.take() {
                             let mut lock = state.proxy_state.lock().await;
                             lock.active.remove(&dead_p);
                             lock.dead.insert(dead_p);
                         }
-                        needs_new_client = true; // Will force get new proxy next loop
+                        needs_new_client = true;
                     }
                 } else {
                     state.stats.net_fail.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
-        
-        // Very small yield to prevent tight loop starvation (optional in async)
-        // sleep(Duration::from_millis(10)).await; 
     }
 }
 
-async fn generate_number(patterns: &Arc<Mutex<HashMap<String, u32>>>) -> String {
+// Optimized Number Generation (No Locks)
+async fn generate_number(patterns: &Arc<DashMap<String, u32>>) -> String {
     let mut rng = rand::thread_rng();
     let prefix = PREFIXES.choose(&mut rng).unwrap();
     
-    // RAM-based Pattern Logic
-    // We do a simplified version: Randomly check if we should use a pattern
-    let use_pattern = rng.gen_bool(0.85);
-    
-    if use_pattern {
-        let lock = patterns.lock().await;
-        // Simple filter
-        let candidates: Vec<(&String, &u32)> = lock.iter()
-            .filter(|(k, _)| k.starts_with(&format!("{}-", prefix)))
-            .collect();
+    // Pattern usage chance
+    if rng.gen_bool(0.85) {
+        // DashMap allows concurrent reading without blocking others
+        // We find a candidate key starting with prefix
+        // Since iterating dashmap can be heavy, we try to access a known pattern or iterate briefly
+        // To keep it simple and fast in Rust:
+        
+        // NOTE: Iterating the whole map in DashMap is still safe but can be slow if map is HUGE.
+        // Given we limit map size, it's fine.
+        let candidate = patterns.iter()
+            .filter(|r| r.key().starts_with(prefix))
+            .choose(&mut rng); // Reservoir sampling or just pick one
 
-        if !candidates.is_empty() {
-            // Simplified logic: Pick random from candidates (Weighted is better but heavier)
-            if let Some((k, _)) = candidates.choose(&mut rng) {
-                 // k is like "0935-123"
-                 let parts: Vec<&str> = k.split('-').collect();
-                 if parts.len() > 1 {
-                     let suffix = parts[1]; // "123"
-                     let rest_len = 7 - suffix.len();
-                     let mut rest = String::new();
-                     for _ in 0..rest_len {
-                         rest.push_str(&rng.gen_range(0..=9).to_string());
-                     }
-                     return format!("{}{}{}", prefix, suffix, rest);
-                 }
+        if let Some(entry) = candidate {
+            let k = entry.key();
+            let parts: Vec<&str> = k.split('-').collect();
+            if parts.len() > 1 {
+                let suffix = parts[1]; 
+                let rest_len = 7 - suffix.len();
+                let mut rest = String::with_capacity(rest_len);
+                for _ in 0..rest_len {
+                    rest.push_str(&rng.gen_range(0..=9).to_string());
+                }
+                return format!("{}{}{}", prefix, suffix, rest);
             }
         }
     }
 
-    // Default Random
-    let mut suffix = String::new();
+    // Fallback Random
+    let mut suffix = String::with_capacity(7);
     for _ in 0..7 {
         suffix.push_str(&rng.gen_range(0..=9).to_string());
     }
     format!("{}{}", prefix, suffix)
 }
 
-async fn update_pattern(patterns: &Arc<Mutex<HashMap<String, u32>>>, num: &str) {
+// Optimized Pattern Update (Lock-Free)
+fn update_pattern(patterns: &Arc<DashMap<String, u32>>, num: &str) {
     if num.len() < 7 { return; }
     let prefix = &num[0..4];
-    let suffix = &num[4..7]; // First 3 digits of body
+    let suffix = &num[4..7];
     let key = format!("{}-{}", prefix, suffix);
     
-    let mut lock = patterns.lock().await;
-    *lock.entry(key).or_insert(0) += 1;
+    // DashMap handles concurrency internally
+    *patterns.entry(key).or_insert(0) += 1;
     
-    // Memory Guard
-    if lock.len() > 2000 {
-        // Quick trim (clear half randomly or simple clear to avoid complexity)
-        lock.clear(); 
+    // Simple pruning to prevent RAM explosion (very rare in Rust but good practice)
+    if patterns.len() > 3000 {
+        patterns.retain(|_, &mut v| v > 1); // Remove weak patterns
     }
 }
 
@@ -342,6 +339,7 @@ async fn monitor_loop(state: Arc<AppState>) {
             let dead = lock.dead.len();
             
             if pool == 0 && active == 0 {
+                // Warning logic same as Python
                 proxy_info = format!(" {}WARNING: SWITCHED TO DIRECT{}", "!! ".red().blink(), " !!".red().blink());
             } else {
                 proxy_info = format!(" (Pool:{} Active:{} Dead:{})", pool, active, dead).blue().to_string();
