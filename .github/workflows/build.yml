@@ -1,6 +1,6 @@
 name: Build Optimized Windows EXE
 
-on: [push]
+on: [workflow_dispatch]
 
 jobs:
   build:
@@ -9,19 +9,16 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    # Cache Rust dependencies to speed up future builds significantly
     - uses: swatinem/rust-cache@v2
     
     - name: Update Rust
       run: rustup update stable
       
     - name: Build Release
-      # Enable link-time optimization (LTO) via flags if needed, 
-      # but default release is usually enough.
       run: cargo build --release
       
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: irancell_bot_final
+        name: irancell_bot_manual
         path: target/release/irancell_bot.exe
