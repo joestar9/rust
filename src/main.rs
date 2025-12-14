@@ -1,33 +1,26 @@
 use anyhow::Result;
+use chrono::Local;
 use crossterm::{
-    cursor,
-    style::{self, Stylize},
-    terminal::{self, Clear, ClearType},
-    ExecutableCommand,
+    style::{Color, Stylize},
+    terminal, ExecutableCommand,
 };
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::prelude::*;
 use reqwest::{header, Client, Proxy};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
+use std::fs;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::sleep;
 
-// ==========================================
-//      تنظیمات هارد کد (HARDCODED AUTH)
-// ==========================================
-const FIXED_TOKEN: &str = "";
-const FIXED_COOKIE: &str = "";
-// ==========================================
-
 const API_URL: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
-
-// دقیقاً همان یوزر ایجنت نسخه پایتون که کار می‌کرد
 const STATIC_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+const CONFIG_FILE: &str = "config.json";
 
 const PREFIXES: [&str; 14] = [
     "0900", "0901", "0902", "0903", "0904", "0905", "0930", "0933", "0935", "0936", "0937", "0938",
@@ -42,6 +35,20 @@ const PROXY_SOURCES: [&str; 6] = [
     "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/refs/heads/master/socks5.txt",
     "https://raw.githubusercontent.com/trio666/proxy-checker/refs/heads/main/socks5.txt"
 ];
+
+// --- Structs ---
+
+#[derive(Deserialize)]
+struct ConfigFile {
+    token: String,
+    cookie: String,
+}
+
+#[derive(Serialize)]
+struct ReferralPayload<'a> {
+    application_name: &'a str,
+    friend_number: String,
+}
 
 struct GlobalStats {
     success: AtomicUsize,
@@ -67,53 +74,65 @@ struct AppState {
     cookie: String,
     use_proxies: bool,
     base_headers: header::HeaderMap,
+    log_tx: mpsc::Sender<LogEvent>, // Channel for live logs
 }
 
-// --- UI Logic ---
-fn setup_terminal() {
-    let mut stdout = io::stdout();
-    let _ = stdout.execute(terminal::SetTitle("Irancell Bot - Stable Rust"));
-    let _ = stdout.execute(Clear(ClearType::All));
-    let _ = stdout.execute(cursor::MoveTo(0, 0));
-    
-    println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║    IRANCELL BOT - FIXED & STABLE (NATIVE TLS)                 ║".cyan().bold());
-    println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
+// Enum for Live Logs
+enum LogEvent {
+    Success { num: String, proxy: String },
+    LogicFail { num: String, status: String },
+    NetFail { num: String, error: String, is_proxy: bool },
+    Info(String),
 }
+
+// --- Helper Functions ---
 
 fn input(prompt: &str) -> String {
-    print!("{}{}", prompt.bold(), style::Attribute::Reset);
+    print!("{}{}", prompt.bold(), crossterm::style::Attribute::Reset);
     io::stdout().flush().unwrap_or_default();
     let mut buffer = String::new();
     io::stdin().read_line(&mut buffer).unwrap_or_default();
     buffer.trim().to_string()
 }
 
+fn load_config() -> (String, String) {
+    if let Ok(content) = fs::read_to_string(CONFIG_FILE) {
+        if let Ok(conf) = serde_json::from_str::<ConfigFile>(&content) {
+            println!("{} Config loaded from {}!", ">>>".green(), CONFIG_FILE);
+            return (conf.token, conf.cookie);
+        }
+    }
+    
+    // Fallback to manual input
+    let token = input("Enter Authorization Token (Bearer ...): ");
+    let cookie = input("Enter Cookie: ");
+    (token, cookie)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    setup_terminal();
+    // Clear screen
+    let mut stdout = io::stdout();
+    let _ = stdout.execute(terminal::Clear(terminal::ClearType::All));
+    let _ = stdout.execute(crossterm::cursor::MoveTo(0, 0));
+    
+    println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
+    println!("{}", "║    IRANCELL BOT - LIVE LOGGING & CONFIG EDITION               ║".cyan().bold());
+    println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
 
-    // --- CONFIG ---
-    let token = if !FIXED_TOKEN.is_empty() {
-        println!("{} Using Hardcoded Token.", ">>>".green());
-        FIXED_TOKEN.to_string()
-    } else {
-        input("Enter Authorization Token (Bearer ...): ")
-    };
-
-    let cookie = if !FIXED_COOKIE.is_empty() {
-        println!("{} Using Hardcoded Cookie.", ">>>".green());
-        FIXED_COOKIE.to_string()
-    } else {
-        input("Enter Cookie: ")
-    };
+    // --- CONFIG LOAD ---
+    let (token, cookie) = load_config();
+    if token.trim().is_empty() || cookie.trim().is_empty() {
+        println!("{}", "Error: Token and Cookie are required.".red());
+        return Ok(());
+    }
 
     let limit: usize = input("Enter Limit (e.g., 20000): ").parse().unwrap_or(100000);
-    let worker_count: usize = input("Number of Managers (default 50): ").parse().unwrap_or(50);
-    let concurrency: usize = input("Concurrency per Manager (default 5): ").parse().unwrap_or(5);
+    let worker_count: usize = input("Managers (default 50): ").parse().unwrap_or(50);
+    let concurrency: usize = input("Concurrency (default 5): ").parse().unwrap_or(5);
     let use_proxies = input("Use Auto-Proxy List? (y/n): ").to_lowercase() == "y";
 
-    // --- SETUP ---
+    // --- PROXY SETUP ---
     let mut initial_queue = VecDeque::new();
     if use_proxies {
         let list = fetch_proxies().await;
@@ -122,11 +141,9 @@ async fn main() -> Result<()> {
         } else {
             initial_queue = list.into();
         }
-    } else {
-        println!("{}", "Running in DIRECT mode.".yellow());
     }
 
-    // --- HEADERS (Exaclty matching Python) ---
+    // --- HEADERS ---
     let mut headers = header::HeaderMap::new();
     headers.insert("Authorization", header::HeaderValue::from_str(&token).unwrap_or(header::HeaderValue::from_static("")));
     headers.insert("Cookie", header::HeaderValue::from_str(&cookie).unwrap_or(header::HeaderValue::from_static("")));
@@ -137,16 +154,22 @@ async fn main() -> Result<()> {
     headers.insert("Accept", header::HeaderValue::from_static("application/json, text/plain, */*"));
     headers.insert("Accept-Language", header::HeaderValue::from_static("fa"));
 
+    // --- LOG CHANNEL ---
+    // Increase channel buffer to prevent blocking workers if logging is slow
+    let (log_tx, log_rx) = mpsc::channel(1000);
+
+    let stats = Arc::new(GlobalStats {
+        success: AtomicUsize::new(0),
+        logic_fail: AtomicUsize::new(0),
+        proxy_fail: AtomicUsize::new(0),
+        net_fail: AtomicUsize::new(0),
+        limit,
+        start_time: Instant::now(),
+        is_running: AtomicBool::new(true),
+    });
+
     let app_state = Arc::new(AppState {
-        stats: Arc::new(GlobalStats {
-            success: AtomicUsize::new(0),
-            logic_fail: AtomicUsize::new(0),
-            proxy_fail: AtomicUsize::new(0),
-            net_fail: AtomicUsize::new(0),
-            limit,
-            start_time: Instant::now(),
-            is_running: AtomicBool::new(true),
-        }),
+        stats: stats.clone(),
         proxy_state: Arc::new(Mutex::new(ProxyState {
             queue: initial_queue,
             active: HashSet::new(),
@@ -157,11 +180,15 @@ async fn main() -> Result<()> {
         cookie,
         use_proxies,
         base_headers: headers,
+        log_tx,
     });
 
-    println!("\n{} Launching {} Managers x {} Concurrency...", ">>>".green(), worker_count, concurrency);
+    println!("\n{} Starting {} Managers...", ">>>".green(), worker_count);
     
-    // --- SPAWN MANAGERS ---
+    // Spawn Log Printer
+    tokio::spawn(logger_loop(log_rx, stats.clone()));
+
+    // Spawn Workers
     for _ in 0..worker_count {
         let state = app_state.clone();
         tokio::spawn(async move {
@@ -169,17 +196,77 @@ async fn main() -> Result<()> {
         });
     }
 
-    // --- MONITOR ---
-    monitor_loop(app_state).await;
+    // Keep main alive
+    while stats.is_running.load(Ordering::Relaxed) {
+        sleep(Duration::from_secs(1)).await;
+    }
+    
+    println!("\n{}", "Finished.".green().bold());
     Ok(())
+}
+
+async fn logger_loop(mut rx: mpsc::Receiver<LogEvent>, stats: Arc<GlobalStats>) {
+    let mut stdout = io::stdout();
+    let start = Instant::now();
+    let mut last_title_update = Instant::now();
+
+    while let Some(event) = rx.recv().await {
+        let now = Local::now().format("%H:%M:%S");
+        
+        match event {
+            LogEvent::Success { num, proxy } => {
+                let _ = writeln!(stdout, "{} {} {} | Px: {}", 
+                    format!("[{}]", now).dim(), 
+                    "[SUCCESS]".green().bold(), 
+                    num, 
+                    if proxy.is_empty() { "Direct" } else { &proxy }
+                );
+            },
+            LogEvent::LogicFail { num, status } => {
+                let _ = writeln!(stdout, "{} {} {} | Status: {}", 
+                    format!("[{}]", now).dim(), 
+                    "[FAIL]".red().bold(), 
+                    num, 
+                    status
+                );
+            },
+            LogEvent::NetFail { num, error, is_proxy } => {
+                // Determine label based on context
+                let label = if is_proxy { "[PROXY-ERR]".yellow() } else { "[NET-ERR]".magenta() };
+                let _ = writeln!(stdout, "{} {} {} | {}", 
+                    format!("[{}]", now).dim(), 
+                    label, 
+                    num, 
+                    error
+                );
+            },
+            LogEvent::Info(msg) => {
+                let _ = writeln!(stdout, "{} {}", format!("[{}]", now).dim(), msg.blue());
+            }
+        }
+
+        // Update Title Bar every 500ms (to avoid syscall spam)
+        if last_title_update.elapsed().as_millis() > 500 {
+            let s = stats.success.load(Ordering::Relaxed);
+            let lf = stats.logic_fail.load(Ordering::Relaxed);
+            let pf = stats.proxy_fail.load(Ordering::Relaxed);
+            let nf = stats.net_fail.load(Ordering::Relaxed);
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { s as f64 / elapsed } else { 0.0 };
+
+            let title = format!("Irancell Bot | OK: {} | Fail: {} | ProxyErr: {} | Rate: {:.1}/s", 
+                s, lf + nf, pf, rate);
+            
+            let _ = stdout.execute(terminal::SetTitle(title));
+            last_title_update = Instant::now();
+        }
+    }
 }
 
 async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
     let mut current_proxy: Option<String> = None;
     let mut client: Option<Client> = None;
     let mut forced_direct = false;
-
-    // Use a Semaphore to control "In-Flight" requests
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
     loop {
@@ -189,7 +276,7 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             break;
         }
 
-        // --- 1. PROXY ACQUISITION ---
+        // --- Proxy Acquisition ---
         if state.use_proxies {
             if current_proxy.is_none() && !forced_direct {
                 let mut lock = state.proxy_state.lock();
@@ -204,14 +291,11 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             }
         }
 
-        // --- 2. CLIENT SETUP (Native TLS for Compatibility) ---
+        // --- Client Build ---
         if client.is_none() {
             let mut builder = Client::builder()
                 .timeout(Duration::from_secs(10))
                 .tcp_nodelay(true)
-                .pool_idle_timeout(Duration::from_secs(30))
-                .pool_max_idle_per_host(concurrency)
-                // Important: Default TLS (Native) matches Python requests
                 .danger_accept_invalid_certs(true);
 
             if let Some(ref p_url) = current_proxy {
@@ -223,6 +307,7 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             match builder.build() {
                 Ok(c) => client = Some(c),
                 Err(_) => {
+                    // Proxy dead on build
                     if let Some(dead) = current_proxy.take() {
                         let mut lock = state.proxy_state.lock();
                         lock.active.remove(&dead);
@@ -234,7 +319,7 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             }
         }
 
-        // --- 3. PIPELINE REQUESTS ---
+        // --- Request Execution ---
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => break, 
@@ -243,16 +328,15 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
         let cli = client.as_ref().unwrap().clone();
         let state_ref = state.clone();
         let num = generate_number(&state.patterns);
+        let proxy_addr_str = current_proxy.clone().unwrap_or_default();
         let is_proxy = state.use_proxies && !forced_direct;
 
         tokio::spawn(async move {
-            // Using serde_json::json! macro is safer and cleaner than custom struct for this API
             let payload = serde_json::json!({
                 "application_name": "NGMI",
                 "friend_number": format!("98{}", &num[1..])
             });
 
-            // Use pre-computed headers, only clone the map (cheap enough in modern Rust)
             let res = cli.post(API_URL)
                 .headers(state_ref.base_headers.clone()) 
                 .json(&payload)
@@ -264,18 +348,30 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
                     if resp.status().is_success() {
                         state_ref.stats.success.fetch_add(1, Ordering::Relaxed);
                         update_pattern(&state_ref.patterns, &num);
+                        // Log Success
+                        let _ = state_ref.log_tx.send(LogEvent::Success { num, proxy: proxy_addr_str }).await;
                     } else {
-                        // 200 OK didn't come, so it's a Logic Fail
                         state_ref.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
+                        // Log Fail
+                        let _ = state_ref.log_tx.send(LogEvent::LogicFail { 
+                            num, 
+                            status: resp.status().as_u16().to_string() 
+                        }).await;
                     }
                 }
-                Err(_) => {
-                    // Network error (Timeout, Proxy dead, etc)
+                Err(e) => {
                     if is_proxy {
                         state_ref.stats.proxy_fail.fetch_add(1, Ordering::Relaxed);
                     } else {
                         state_ref.stats.net_fail.fetch_add(1, Ordering::Relaxed);
                     }
+                    // Log Error
+                    let error_msg = if e.is_timeout() { "Timeout".to_string() } else { "Conn Err".to_string() };
+                    let _ = state_ref.log_tx.send(LogEvent::NetFail { 
+                        num, 
+                        error: error_msg,
+                        is_proxy 
+                    }).await;
                 }
             }
             drop(permit); 
@@ -305,7 +401,6 @@ fn update_pattern(patterns: &DashMap<String, u32>, num: &str) {
 }
 
 async fn fetch_proxies() -> Vec<String> {
-    println!("{}", "[Proxy Manager] Downloading proxies...".yellow());
     let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
     let mut collected = HashSet::new();
 
@@ -332,50 +427,4 @@ async fn fetch_proxies() -> Vec<String> {
     list.shuffle(&mut rng);
     println!("{} Total Proxies: {}\n", "[Proxy Manager]".green(), list.len());
     list
-}
-
-async fn monitor_loop(state: Arc<AppState>) {
-    loop {
-        sleep(Duration::from_secs(1)).await;
-
-        let s = state.stats.success.load(Ordering::Relaxed);
-        let lf = state.stats.logic_fail.load(Ordering::Relaxed);
-        let pf = state.stats.proxy_fail.load(Ordering::Relaxed);
-        let nf = state.stats.net_fail.load(Ordering::Relaxed);
-        
-        let elapsed = state.stats.start_time.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { s as f64 / elapsed } else { 0.0 };
-
-        let proxy_info;
-        if state.use_proxies {
-            let lock = state.proxy_state.lock();
-            let pool = lock.queue.len();
-            let active = lock.active.len();
-            let dead = lock.dead.len();
-            
-            if pool == 0 && active == 0 {
-                proxy_info = format!(" {}WARNING: SWITCHED TO DIRECT{}", "!! ".red().slow_blink(), " !!".red().slow_blink());
-            } else {
-                proxy_info = format!(" (Pool:{} Active:{} Dead:{})", pool, active, dead).blue().to_string();
-            }
-        } else {
-            proxy_info = " (MODE: DIRECT)".magenta().to_string();
-        }
-
-        print!("\r[ SUCCESS: {}/{} ] [ LOGIC FAIL: {} ] [ {} FAIL: {} ] [ SPEED: {:.1}/s ]{}", 
-            s.to_string().green().bold(), 
-            state.stats.limit,
-            lf.to_string().red(),
-            if state.use_proxies { "PROXY".yellow() } else { "NET".yellow() },
-            if state.use_proxies { pf } else { nf },
-            rate.to_string().cyan(),
-            proxy_info
-        );
-        io::stdout().flush().unwrap_or_default();
-
-        if !state.stats.is_running.load(Ordering::Relaxed) {
-            println!("\n\n{}", ">>> TARGET REACHED! DONE.".green().bold());
-            break;
-        }
-    }
 }
