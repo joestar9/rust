@@ -34,7 +34,7 @@ const PREFIXES: [&str; 14] = [
     "0939", "0941",
 ];
 
-const PROXY_SOURCES: [&str; 6] = [
+const PROXY_SOURCES: [&str; 10] = [
     "https://raw.githubusercontent.com/databay-labs/free-proxy-list/refs/heads/master/socks5.txt",
     "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks5.txt",
     "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/socks5.txt",
