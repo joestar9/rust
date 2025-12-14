@@ -5,9 +5,10 @@ use crossterm::{
     terminal, ExecutableCommand,
 };
 use dashmap::DashMap;
+use futures::future::join_all;
 use parking_lot::Mutex;
 use rand::prelude::*;
-use reqwest::{header, Client, Proxy};
+use reqwest::{header, Client, Proxy, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -51,8 +52,7 @@ struct ReferralPayload<'a> {
 struct GlobalStats {
     success: AtomicUsize,
     logic_fail: AtomicUsize,
-    // We keep these for internal stats, but won't spam logs
-    proxy_fail: AtomicUsize, 
+    proxy_fail: AtomicUsize,
     net_fail: AtomicUsize,
     limit: usize,
     start_time: Instant,
@@ -79,7 +79,7 @@ struct AppState {
 enum LogEvent {
     Success { num: String, proxy: String },
     LogicFail { num: String, status: String },
-    // NetFail removed from logs to keep it clean, only internal stats updated
+    TokenDead, 
 }
 
 fn input(prompt: &str) -> String {
@@ -108,9 +108,9 @@ async fn main() -> Result<()> {
     let _ = stdout.execute(terminal::Clear(terminal::ClearType::All));
     let _ = stdout.execute(crossterm::cursor::MoveTo(0, 0));
     
-    println!("{}", "╔════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║         IRANCELL REFERRAL BOT          ║".cyan().bold());
-    println!("{}", "╚════════════════════════════════════════╝".cyan().bold());
+    println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
+    println!("{}", "║    IRANCELL BOT - REMOTE DNS & HTTP/1.1 STABILITY             ║".cyan().bold());
+    println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
 
     let (token, cookie) = load_config();
     if token.trim().is_empty() || cookie.trim().is_empty() {
@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
 
     let mut initial_queue = VecDeque::new();
     if use_proxies {
-        let list = fetch_proxies().await;
+        let list = fetch_proxies_parallel().await;
         if list.is_empty() {
             println!("{}", "Warning: No proxies found. Switching to DIRECT mode.".red());
         } else {
@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
         sleep(Duration::from_secs(1)).await;
     }
     
-    println!("\n{}", "Finished.".green().bold());
+    println!("\n{}", "Program Stopped.".green().bold());
     Ok(())
 }
 
@@ -214,6 +214,13 @@ async fn logger_loop(mut rx: mpsc::Receiver<LogEvent>, stats: Arc<GlobalStats>) 
                     status
                 );
             },
+            LogEvent::TokenDead => {
+                let _ = writeln!(stdout, "\n{} {} {}\n", 
+                    "!!!".red().slow_blink(),
+                    "CRITICAL ERROR: TOKEN/COOKIE IS INVALID (401)".red().bold().underlined(),
+                    "!!!".red().slow_blink()
+                );
+            }
         }
 
         if last_title_update.elapsed().as_millis() > 500 {
@@ -224,7 +231,7 @@ async fn logger_loop(mut rx: mpsc::Receiver<LogEvent>, stats: Arc<GlobalStats>) 
             let elapsed = start.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 { s as f64 / elapsed } else { 0.0 };
 
-            let title = format!("Irancell Bot | OK: {} | Fail: {} | Retry/Net: {} | Rate: {:.1}/s", 
+            let title = format!("Irancell Bot | OK: {} | Fail: {} | Retry: {} | Rate: {:.1}/s", 
                 s, lf, pf + nf, rate);
             
             let _ = stdout.execute(terminal::SetTitle(title));
@@ -238,9 +245,6 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
     let mut client: Option<Client> = None;
     let mut forced_direct = false;
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    
-    // RETRY QUEUE: Numbers that failed network and need retrying
-    // This channel allows workers to send failed numbers back to the manager
     let (retry_tx, mut retry_rx) = mpsc::channel::<String>(concurrency * 2);
 
     loop {
@@ -265,14 +269,18 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             }
         }
 
-        // --- Client Build ---
+        // --- CLIENT REBUILD (THE FIX) ---
         if client.is_none() {
             let mut builder = Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(12)) // Total Timeout
+                .connect_timeout(Duration::from_secs(5)) // Fast Proxy Check
+                .http1_only() // FORCE HTTP/1.1 -> Fixes 99% of free proxy issues
                 .tcp_nodelay(true)
                 .danger_accept_invalid_certs(true);
 
             if let Some(ref p_url) = current_proxy {
+                // Ensure proper remote DNS resolution via socks5h
+                // The URL is already formatted as socks5h:// in fetch_proxies
                 if let Ok(proxy) = Proxy::all(p_url) {
                     builder = builder.proxy(proxy);
                 }
@@ -281,30 +289,26 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             match builder.build() {
                 Ok(c) => client = Some(c),
                 Err(_) => {
-                    // Proxy dead on build, drop it
+                    // Build failed -> Proxy is likely garbage
                     if let Some(dead) = current_proxy.take() {
                         let mut lock = state.proxy_state.lock();
                         lock.active.remove(&dead);
                         lock.dead.insert(dead);
                     }
-                    // If we have retries pending, we should sleep a bit to avoid hot loop
                     sleep(Duration::from_millis(500)).await;
                     continue;
                 }
             }
         }
 
-        // --- Acquire Slot ---
         let permit = match semaphore.clone().acquire_owned().await {
             Ok(p) => p,
             Err(_) => break, 
         };
 
-        // --- Decide Number (New or Retry) ---
-        // Priority: Retry Queue > New Number
         let num_to_process = match retry_rx.try_recv() {
-            Ok(n) => n, // We have a failed number to retry!
-            Err(_) => generate_number(&state.patterns) // Generate fresh
+            Ok(n) => n, 
+            Err(_) => generate_number(&state.patterns) 
         };
 
         let cli = client.as_ref().unwrap().clone();
@@ -327,14 +331,17 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
 
             match res {
                 Ok(resp) => {
-                    if resp.status().is_success() {
-                        // FINAL SUCCESS
+                    if resp.status() == StatusCode::UNAUTHORIZED {
+                        if state_ref.stats.is_running.swap(false, Ordering::Relaxed) {
+                            let _ = state_ref.log_tx.send(LogEvent::TokenDead).await;
+                        }
+                    } 
+                    else if resp.status().is_success() {
                         state_ref.stats.success.fetch_add(1, Ordering::Relaxed);
                         update_pattern(&state_ref.patterns, &num_to_process);
                         let _ = state_ref.log_tx.send(LogEvent::Success { num: num_to_process, proxy: proxy_addr_str }).await;
-                    } else {
-                        // FINAL LOGIC FAIL (e.g., 400 Bad Request, 500 Server Error)
-                        // We do NOT retry logic fails (usually means invalid number or already invited)
+                    } 
+                    else {
                         state_ref.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
                         let _ = state_ref.log_tx.send(LogEvent::LogicFail { 
                             num: num_to_process, 
@@ -343,19 +350,12 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
                     }
                 }
                 Err(_) => {
-                    // NETWORK ERROR -> RETRY
                     if is_proxy {
                         state_ref.stats.proxy_fail.fetch_add(1, Ordering::Relaxed);
                     } else {
                         state_ref.stats.net_fail.fetch_add(1, Ordering::Relaxed);
                     }
-                    
-                    // CRITICAL: We do NOT log this. We send it back to the queue.
-                    // The manager will pick it up and try again (possibly with a new proxy if the current one dies).
                     let _ = retry_tx_clone.send(num_to_process).await;
-                    
-                    // Note: We don't mark proxy dead here directly to avoid lock contention.
-                    // We let the manager naturally rotate if connection errors pile up or client build fails.
                 }
             }
             drop(permit); 
@@ -384,32 +384,52 @@ fn update_pattern(patterns: &DashMap<String, u32>, num: &str) {
     }
 }
 
-async fn fetch_proxies() -> Vec<String> {
-    println!("{}", "[Proxy Manager] Downloading proxies...".yellow());
+async fn fetch_proxies_parallel() -> Vec<String> {
+    println!("{}", "[Proxy Manager] Downloading proxies in parallel...".yellow());
     let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    
+    let tasks: Vec<_> = PROXY_SOURCES.iter().map(|url| {
+        let client = client.clone();
+        let url = url.to_string();
+        tokio::spawn(async move {
+            match client.get(&url).send().await {
+                Ok(resp) => match resp.text().await {
+                    Ok(text) => Some(text),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        })
+    }).collect();
+
+    let results = join_all(tasks).await;
     let mut collected = HashSet::new();
 
-    for url in PROXY_SOURCES {
-        if let Ok(resp) = client.get(url).send().await {
-            if let Ok(text) = resp.text().await {
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() { continue; }
-                    let proxy = if !line.contains("://") {
-                        format!("socks5://{}", line)
-                    } else if line.to_lowercase().starts_with("socks5://") {
-                        line.to_string()
-                    } else {
-                        continue;
-                    };
-                    collected.insert(proxy);
+    for res in results {
+        if let Ok(Some(text)) = res {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                
+                // --- VITAL FIX: Force Remote DNS (socks5h) ---
+                // If it's just IP:PORT, assume socks5h
+                // If it's socks5://, replace with socks5h://
+                let proxy_url = if !line.contains("://") {
+                    format!("socks5h://{}", line) // Add 'h' for remote DNS
+                } else {
+                    line.replace("socks5://", "socks5h://") // Replace if exists
+                };
+                
+                if proxy_url.starts_with("socks5h://") {
+                    collected.insert(proxy_url);
                 }
             }
         }
     }
+
     let mut list: Vec<String> = collected.into_iter().collect();
     let mut rng = rand::thread_rng();
     list.shuffle(&mut rng);
-    println!("{} Total Proxies: {}\n", "[Proxy Manager]".green(), list.len());
+    println!("{} Total Proxies Ready (DNS Optimized): {}\n", "[Proxy Manager]".green(), list.len());
     list
 }
