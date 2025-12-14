@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::Local;
 use crossterm::{
-    style::{Color, Stylize},
+    style::Stylize, // Removed unused Color
     terminal, ExecutableCommand,
 };
 use dashmap::DashMap;
@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
     let _ = stdout.execute(crossterm::cursor::MoveTo(0, 0));
     
     println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║    IRANCELL BOT - REMOTE DNS & HTTP/1.1 STABILITY             ║".cyan().bold());
+    println!("{}", "║    IRANCELL BOT - PARALLEL PROXY (FIXED BUILD)                ║".cyan().bold());
     println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
 
     let (token, cookie) = load_config();
@@ -254,7 +254,6 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             break;
         }
 
-        // --- Proxy Management ---
         if state.use_proxies {
             if current_proxy.is_none() && !forced_direct {
                 let mut lock = state.proxy_state.lock();
@@ -269,18 +268,15 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             }
         }
 
-        // --- CLIENT REBUILD (THE FIX) ---
         if client.is_none() {
             let mut builder = Client::builder()
-                .timeout(Duration::from_secs(12)) // Total Timeout
-                .connect_timeout(Duration::from_secs(5)) // Fast Proxy Check
-                .http1_only() // FORCE HTTP/1.1 -> Fixes 99% of free proxy issues
+                .timeout(Duration::from_secs(12))
+                .connect_timeout(Duration::from_secs(5))
+                .http1_only()
                 .tcp_nodelay(true)
                 .danger_accept_invalid_certs(true);
 
             if let Some(ref p_url) = current_proxy {
-                // Ensure proper remote DNS resolution via socks5h
-                // The URL is already formatted as socks5h:// in fetch_proxies
                 if let Ok(proxy) = Proxy::all(p_url) {
                     builder = builder.proxy(proxy);
                 }
@@ -289,7 +285,6 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             match builder.build() {
                 Ok(c) => client = Some(c),
                 Err(_) => {
-                    // Build failed -> Proxy is likely garbage
                     if let Some(dead) = current_proxy.take() {
                         let mut lock = state.proxy_state.lock();
                         lock.active.remove(&dead);
@@ -363,7 +358,8 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
     }
 }
 
-fn generate_number(patterns: &DashMap<String, u32>) -> String {
+// Renamed _patterns to avoid warning, but keeping signature for future logic
+fn generate_number(_patterns: &DashMap<String, u32>) -> String {
     let mut rng = rand::thread_rng();
     let prefix = PREFIXES.choose(&mut rng).unwrap();
     let mut suffix = String::with_capacity(7);
@@ -384,6 +380,7 @@ fn update_pattern(patterns: &DashMap<String, u32>, num: &str) {
     }
 }
 
+// Fixed type inference error here
 async fn fetch_proxies_parallel() -> Vec<String> {
     println!("{}", "[Proxy Manager] Downloading proxies in parallel...".yellow());
     let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
@@ -408,16 +405,13 @@ async fn fetch_proxies_parallel() -> Vec<String> {
     for res in results {
         if let Ok(Some(text)) = res {
             for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() { continue; }
+                let line_str: &str = line.trim(); // Fixed type hint
+                if line_str.is_empty() { continue; }
                 
-                // --- VITAL FIX: Force Remote DNS (socks5h) ---
-                // If it's just IP:PORT, assume socks5h
-                // If it's socks5://, replace with socks5h://
-                let proxy_url = if !line.contains("://") {
-                    format!("socks5h://{}", line) // Add 'h' for remote DNS
+                let proxy_url = if !line_str.contains("://") {
+                    format!("socks5h://{}", line_str)
                 } else {
-                    line.replace("socks5://", "socks5h://") // Replace if exists
+                    line_str.replace("socks5://", "socks5h://")
                 };
                 
                 if proxy_url.starts_with("socks5h://") {
