@@ -9,7 +9,6 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::prelude::*;
 use reqwest::{header, Client, Proxy};
-use serde::Serialize;
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -27,12 +26,8 @@ const FIXED_COOKIE: &str = "";
 
 const API_URL: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 
-const USER_AGENTS: [&str; 4] = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-];
+// دقیقاً همان یوزر ایجنت نسخه پایتون که کار می‌کرد
+const STATIC_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
 const PREFIXES: [&str; 14] = [
     "0900", "0901", "0902", "0903", "0904", "0905", "0930", "0933", "0935", "0936", "0937", "0938",
@@ -47,12 +42,6 @@ const PROXY_SOURCES: [&str; 6] = [
     "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/refs/heads/master/socks5.txt",
     "https://raw.githubusercontent.com/trio666/proxy-checker/refs/heads/main/socks5.txt"
 ];
-
-#[derive(Serialize)]
-struct ReferralPayload<'a> {
-    application_name: &'a str,
-    friend_number: String,
-}
 
 struct GlobalStats {
     success: AtomicUsize,
@@ -77,17 +66,18 @@ struct AppState {
     token: String,
     cookie: String,
     use_proxies: bool,
+    base_headers: header::HeaderMap,
 }
 
 // --- UI Logic ---
 fn setup_terminal() {
     let mut stdout = io::stdout();
-    let _ = stdout.execute(terminal::SetTitle("Irancell Bot - Rust Edition"));
+    let _ = stdout.execute(terminal::SetTitle("Irancell Bot - Stable Rust"));
     let _ = stdout.execute(Clear(ClearType::All));
     let _ = stdout.execute(cursor::MoveTo(0, 0));
     
     println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║    IRANCELL BOT - STABLE & FAST (FIXED BUILD)                 ║".cyan().bold());
+    println!("{}", "║    IRANCELL BOT - FIXED & STABLE (NATIVE TLS)                 ║".cyan().bold());
     println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
 }
 
@@ -119,7 +109,7 @@ async fn main() -> Result<()> {
     };
 
     let limit: usize = input("Enter Limit (e.g., 20000): ").parse().unwrap_or(100000);
-    let worker_count: usize = input("Number of Proxy Managers (default 50): ").parse().unwrap_or(50);
+    let worker_count: usize = input("Number of Managers (default 50): ").parse().unwrap_or(50);
     let concurrency: usize = input("Concurrency per Manager (default 5): ").parse().unwrap_or(5);
     let use_proxies = input("Use Auto-Proxy List? (y/n): ").to_lowercase() == "y";
 
@@ -135,6 +125,17 @@ async fn main() -> Result<()> {
     } else {
         println!("{}", "Running in DIRECT mode.".yellow());
     }
+
+    // --- HEADERS (Exaclty matching Python) ---
+    let mut headers = header::HeaderMap::new();
+    headers.insert("Authorization", header::HeaderValue::from_str(&token).unwrap_or(header::HeaderValue::from_static("")));
+    headers.insert("Cookie", header::HeaderValue::from_str(&cookie).unwrap_or(header::HeaderValue::from_static("")));
+    headers.insert("User-Agent", header::HeaderValue::from_static(STATIC_USER_AGENT));
+    headers.insert("Origin", header::HeaderValue::from_static("https://my.irancell.ir"));
+    headers.insert("Referer", header::HeaderValue::from_static("https://my.irancell.ir/"));
+    headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
+    headers.insert("Accept", header::HeaderValue::from_static("application/json, text/plain, */*"));
+    headers.insert("Accept-Language", header::HeaderValue::from_static("fa"));
 
     let app_state = Arc::new(AppState {
         stats: Arc::new(GlobalStats {
@@ -155,6 +156,7 @@ async fn main() -> Result<()> {
         token,
         cookie,
         use_proxies,
+        base_headers: headers,
     });
 
     println!("\n{} Launching {} Managers x {} Concurrency...", ">>>".green(), worker_count, concurrency);
@@ -202,14 +204,14 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
             }
         }
 
-        // --- 2. CLIENT OPTIMIZATION ---
+        // --- 2. CLIENT SETUP (Native TLS for Compatibility) ---
         if client.is_none() {
             let mut builder = Client::builder()
-                .timeout(Duration::from_secs(12))
+                .timeout(Duration::from_secs(10))
                 .tcp_nodelay(true)
-                .pool_idle_timeout(Duration::from_secs(45))
-                .pool_max_idle_per_host(concurrency) 
-                .user_agent(*USER_AGENTS.choose(&mut rand::thread_rng()).unwrap())
+                .pool_idle_timeout(Duration::from_secs(30))
+                .pool_max_idle_per_host(concurrency)
+                // Important: Default TLS (Native) matches Python requests
                 .danger_accept_invalid_certs(true);
 
             if let Some(ref p_url) = current_proxy {
@@ -244,18 +246,15 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
         let is_proxy = state.use_proxies && !forced_direct;
 
         tokio::spawn(async move {
-            let payload = ReferralPayload {
-                application_name: "NGMI",
-                friend_number: format!("98{}", &num[1..]),
-            };
+            // Using serde_json::json! macro is safer and cleaner than custom struct for this API
+            let payload = serde_json::json!({
+                "application_name": "NGMI",
+                "friend_number": format!("98{}", &num[1..])
+            });
 
-            // Manual Header Construction for Speed (Avoids HeaderMap clone overhead)
+            // Use pre-computed headers, only clone the map (cheap enough in modern Rust)
             let res = cli.post(API_URL)
-                .header("Authorization", &state_ref.token)
-                .header("Cookie", &state_ref.cookie)
-                .header("Origin", "https://my.irancell.ir")
-                .header("Referer", "https://my.irancell.ir/")
-                .header("Content-Type", "application/json")
+                .headers(state_ref.base_headers.clone()) 
                 .json(&payload)
                 .send()
                 .await;
@@ -266,10 +265,12 @@ async fn manager_loop(state: Arc<AppState>, concurrency: usize) {
                         state_ref.stats.success.fetch_add(1, Ordering::Relaxed);
                         update_pattern(&state_ref.patterns, &num);
                     } else {
+                        // 200 OK didn't come, so it's a Logic Fail
                         state_ref.stats.logic_fail.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Err(_) => {
+                    // Network error (Timeout, Proxy dead, etc)
                     if is_proxy {
                         state_ref.stats.proxy_fail.fetch_add(1, Ordering::Relaxed);
                     } else {
