@@ -108,9 +108,9 @@ async fn main() -> Result<()> {
     let _ = stdout.execute(terminal::Clear(terminal::ClearType::All));
     let _ = stdout.execute(crossterm::cursor::MoveTo(0, 0));
     
-    println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║    IRANCELL BOT - PERSISTENT RETRY & CLEAN LOGS               ║".cyan().bold());
-    println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
+    println!("{}", "╔════════════════════════════════════════╗".cyan().bold());
+    println!("{}", "║         IRANCELL REFERRAL BOT          ║".cyan().bold());
+    println!("{}", "╚════════════════════════════════════════╝".cyan().bold());
 
     let (token, cookie) = load_config();
     if token.trim().is_empty() || cookie.trim().is_empty() {
