@@ -109,9 +109,9 @@ async fn main() -> Result<()> {
     let _ = stdout.execute(terminal::Clear(terminal::ClearType::All));
     let _ = stdout.execute(crossterm::cursor::MoveTo(0, 0));
     
-    println!("{}", "╔═══════════════════════════════════════════════════════════════╗".cyan().bold());
-    println!("{}", "║    IRANCELL BOT - MODULAR PROXY SYSTEM (ONLINE/LOCAL)         ║".cyan().bold());
-    println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan().bold());
+    println!("{}", "╔════════════════════════════╗".cyan().bold());
+    println!("{}", "║       -IRANCELL BOT-       ║".cyan().bold());
+    println!("{}", "╚════════════════════════════╝".cyan().bold());
 
     let (token, cookie) = load_config();
     if token.trim().is_empty() {
@@ -120,15 +120,15 @@ async fn main() -> Result<()> {
     }
 
     let limit: usize = input("Enter Limit (e.g., 20000): ").parse().unwrap_or(100000);
-    let worker_count: usize = input("Managers (default 50): ").parse().unwrap_or(50);
-    let concurrency: usize = input("Concurrency (default 5): ").parse().unwrap_or(5);
+    let worker_count: usize = input("Managers (Best 20-30): ").parse().unwrap_or(20);
+    let concurrency: usize = input("Concurrency (Best 2-4): ").parse().unwrap_or(2);
     let use_proxies = input("Use Proxies? (y/n): ").to_lowercase() == "y";
 
     let mut initial_queue = VecDeque::new();
     
     if use_proxies {
         println!("\n{}", "Select Proxy Source:".yellow().bold());
-        println!("1. Online (Fetch links from GitHub Master List)");
+        println!("1. Auto");
         println!("2. Local File ({})", LOCAL_PROXY_FILE);
         let choice = input("Choice (1 or 2): ");
 
@@ -354,7 +354,7 @@ async fn logger_loop(mut rx: mpsc::Receiver<LogEvent>, stats: Arc<GlobalStats>) 
             let nf = stats.net_fail.load(Ordering::Relaxed);
             let elapsed = start.elapsed().as_secs_f64();
             let rate = if elapsed > 0.0 { s as f64 / elapsed } else { 0.0 };
-            let title = format!("Irancell Bot | Sent: {} | Invalid: {} | NetRetry: {} | Rate: {:.1}/s", s, lf, pf + nf, rate);
+            let title = format!("Sent: {} | Invalid: {} | NetRetry: {} | Rate: {:.1}/s", s, lf, pf + nf, rate);
             let _ = stdout.execute(terminal::SetTitle(title));
             last_title_update = Instant::now();
         }
