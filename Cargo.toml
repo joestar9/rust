@@ -1,7 +1,7 @@
 [package]
 name = "irancell_bot"
 version = "8.0.0"
-edition = "2021"
+edition = "2025"
 
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
