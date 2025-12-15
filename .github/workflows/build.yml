@@ -1,42 +1,13 @@
-name: Build Multi-Platform
+[package]
+name = "irancell_pro_invite"
+version = "3.0.0"
+edition = "2021"
 
-on: [workflow_dispatch]
-
-jobs:
-  build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            artifact_name: irancell_bot_windows.exe
-            binary_path: target/release/irancell_bot.exe
-          
-          - os: ubuntu-latest
-            artifact_name: irancell_bot_linux
-            binary_path: target/release/irancell_bot
-
-    steps:
-    - uses: actions/checkout@v4
-    
-    - uses: swatinem/rust-cache@v2
-    
-    - name: Update Rust
-      run: rustup update stable
-
-    - name: Install Linux Dependencies
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libssl-dev pkg-config
-
-    - name: Build Release
-      run: cargo build --release
-      
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ matrix.artifact_name }}
-        path: ${{ matrix.binary_path }}
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "zstd", "socks", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+chrono = "0.4"
+anyhow = "1.0"
