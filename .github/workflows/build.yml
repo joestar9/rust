@@ -1,13 +1,75 @@
-[package]
-name = "irancell_pro_invite"
-version = "3.0.0"
-edition = "2021"
+name: Build Rust Application (2025 Standard)
 
-[dependencies]
-reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "zstd", "socks", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-rand = "0.8"
-chrono = "0.4"
-anyhow = "1.0"
+# این ورک‌فلو با هر بار Push روی شاخه اصلی یا به صورت دستی اجرا می‌شود
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # تنظیمات بیلد لینوکس
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: irancell_invite_linux_x64
+            executable_name: irancell_pro_invite
+          
+          # تنظیمات بیلد ویندوز
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: irancell_invite_windows_x64.exe
+            executable_name: irancell_pro_invite.exe
+
+    steps:
+    # 1. دریافت آخرین کدها از مخزن
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    # 2. نصب Rust Toolchain (آخرین نسخه پایدار)
+    - name: Install Rust Toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    # 3. کش کردن وابستگی‌ها برای سرعت بیشتر بیلد (استاندارد مدرن)
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+
+    # 4. بیلد پروژه با فلگ ریلیز (بهینه شده)
+    - name: Build Release
+      run: cargo build --release --target ${{ matrix.target }}
+
+    # 5. آماده‌سازی فایل‌ها برای آپلود (تغییر نام و جابجایی)
+    - name: Prepare Artifacts
+      shell: bash
+      run: |
+        mkdir release_pack
+        
+        # کپی فایل اجرایی
+        if [ "${{ matrix.os }}" == "windows-latest" ]; then
+          cp target/${{ matrix.target }}/release/${{ matrix.executable_name }} release_pack/${{ matrix.artifact_name }}
+        else
+          cp target/${{ matrix.target }}/release/${{ matrix.executable_name }} release_pack/${{ matrix.artifact_name }}
+        fi
+        
+        # کپی فایل کانفیگ نمونه (اگر وجود دارد)
+        if [ -f config.json ]; then
+          cp config.json release_pack/
+        fi
+
+    # 6. آپلود خروجی نهایی در بخش Artifacts گیت‌هاب
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: release_pack/*
+        if-no-files-found: error
