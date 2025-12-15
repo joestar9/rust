@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
+// ✅ New Rand 0.9 prelude
 use rand::prelude::*; 
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
@@ -60,7 +61,7 @@ fn read_config() -> Result<AppConfig> {
 
 fn generate_random_suffix() -> String {
     let chars: Vec<char> = "1234567890".chars().collect();
-    // ✅ UPDATE: Use rand::rng()
+    // ✅ Rand 0.9 syntax
     let mut rng = rand::rng(); 
     chars.choose_multiple(&mut rng, 7).collect()
 }
@@ -184,8 +185,11 @@ async fn fetch_validate_and_build(token: String) -> Result<Vec<Client>> {
     }
 
     for t in check_tasks { let _ = t.await; }
+
+    // ✅ FIX: Explicit type annotation for the compiler
     let final_list: Vec<Client> = valid_clients.lock().await.drain(..).collect();
     println!("\n✅ Process Complete. Pool size: {} clients.", final_list.len());
+    
     Ok(final_list)
 }
 
@@ -267,14 +271,16 @@ async fn process_number(
                 if debug_mode { log_to_file(format!("❌ [HTTP {}] {}", resp.status(), phone)).await; }
             }
         },
-        Err(e) => { if debug_mode { log_to_file(format!("❌ [Step 1 Net] {}: {}", phone, e)).await; } }
+        Err(e) => { 
+            if debug_mode { log_to_file(format!("❌ [Step 1 Net] {}: {}", phone, e)).await; } 
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    #[cfg(windows)]
-    let _ = yansi::Paint::enable_windows_ascii();
+    // ✅ FIX: Removed yansi call to fix Windows build error
+    // Windows 10+ supports ANSI natively now.
 
     let config = read_config()?;
     let debug_mode = config.debug.unwrap_or(false);
@@ -342,7 +348,6 @@ async fn main() -> Result<()> {
             
             let client_clone = client.clone();
             let succ_clone = success_count.clone();
-            // ✅ FIX: Use .choose(...) directly on the Vec/Slice reference
             let prefix = prefixes.choose(&mut rand::rng()).unwrap().clone();
             let shutdown_clone = shutdown_tx.clone();
             
@@ -365,7 +370,6 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             loop {
                 if *gen_rx.borrow() { break; }
-                // ✅ FIX: Use rand::rng()
                 let prefix = prefixes_clone.choose(&mut rand::rng()).unwrap();
                 let num = format!("98{}{}", prefix, generate_random_suffix());
                 if tx.send(num).await.is_err() { break; }
@@ -389,7 +393,7 @@ async fn main() -> Result<()> {
                     let client_opt = {
                         let pool = pool_clone.read().await;
                         if !pool.is_empty() {
-                            // ✅ FIX: Explicit cast to slice for .choose()
+                            // ✅ FIX: .as_slice() ensures .choose() works perfectly on locks
                             pool.as_slice().choose(&mut rand::rng()).cloned()
                         } else { None }
                     };
