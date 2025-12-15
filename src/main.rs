@@ -16,7 +16,7 @@ const CONFIG_FILE: &str = "config.json";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
 const PROXY_URL_SOURCE: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.txt";
-const TARGET_COUNT: usize = 1000;
+// TARGET_COUNT removed (now dynamic)
 
 // --- Structs ---
 
@@ -42,7 +42,6 @@ struct AppConfig {
 // --- Helper Functions ---
 
 fn read_config() -> Result<AppConfig> {
-    // Check if file exists
     if !std::path::Path::new(CONFIG_FILE).exists() {
         return Err(anyhow!("❌ '{}' not found. Please create it with 'token' and 'prefixes'.", CONFIG_FILE));
     }
@@ -91,15 +90,13 @@ fn read_local_proxies() -> Result<Vec<String>> {
     let file = File::open("socks5.txt").context("Could not open socks5.txt")?;
     let reader = BufReader::new(file);
     let proxies: Vec<String> = reader
-        .lines() // This works now because BufRead is imported
+        .lines()
         .map(|l| l.unwrap_or_default().trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
     Ok(proxies)
 }
 
-/// Builds a client with specific headers and optional proxy
-/// Used for Proxy Mode validation and requests
 async fn build_client_with_proxy(proxy_addr: &str, token: &str) -> Option<Client> {
     let proxy = match Proxy::all(proxy_addr) {
         Ok(p) => p,
@@ -110,11 +107,9 @@ async fn build_client_with_proxy(proxy_addr: &str, token: &str) -> Option<Client
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
     headers.insert("Accept-Language", "fa".parse().unwrap());
-    // Note: Do not manually set Accept-Encoding, let reqwest handle it with features
     headers.insert("Origin", "https://my.irancell.ir".parse().unwrap());
     headers.insert("x-app-version", "9.62.0".parse().unwrap());
     
-    // Safety check for token characters
     if let Ok(val) = reqwest::header::HeaderValue::from_str(token) {
         headers.insert("Authorization", val);
     }
@@ -126,7 +121,6 @@ async fn build_client_with_proxy(proxy_addr: &str, token: &str) -> Option<Client
 
     match client_builder.build() {
         Ok(client) => {
-            // Health check: Quick HEAD request
             if client.head("https://my.irancell.ir").send().await.is_ok() {
                 Some(client)
             } else {
@@ -137,7 +131,6 @@ async fn build_client_with_proxy(proxy_addr: &str, token: &str) -> Option<Client
     }
 }
 
-/// Helper to build the main Direct Mode client once
 fn build_direct_client(token: &str) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/144.0".parse().unwrap());
@@ -165,7 +158,6 @@ async fn process_number(
         friend_number: phone.clone(),
     };
 
-    // Step 1: Check Eligibility
     let res1 = client
         .post(API_CHECK_APP)
         .header("Referer", "https://my.irancell.ir/invite")
@@ -177,7 +169,6 @@ async fn process_number(
         Ok(resp) if resp.status().is_success() => {
              let body: Value = resp.json().await.unwrap_or(Value::Null);
              if body["message"] == "done" {
-                // Step 2: Send Invite
                 let res2 = client
                     .post(API_SEND_INVITE)
                     .header("Referer", "https://my.irancell.ir/invite/confirm")
@@ -194,11 +185,11 @@ async fn process_number(
                              *lock += 1;
                          }
                     },
-                    _ => {} // Ignore errors
+                    _ => {}
                 }
              }
         },
-        _ => {} // Ignore errors
+        _ => {}
     }
 }
 
@@ -213,6 +204,10 @@ async fn main() -> Result<()> {
     };
 
     println!("📱 Loaded {} prefixes.", config.prefixes.len());
+
+    // --- NEW: Ask for Target Count ---
+    let count_input = prompt_input("🎯 Target Count (How many numbers?): ");
+    let target_count: usize = count_input.parse().unwrap_or(1000); // Default to 1000 if invalid
 
     // --- 2. Mode Selection ---
     println!("\n✨ Select Mode:");
@@ -247,11 +242,10 @@ async fn main() -> Result<()> {
             Err(e) => eprintln!("❌ Failed to fetch proxies: {}", e),
         }
 
-        // Auto-Update Task
         let p_list_clone = proxy_list.clone();
         tokio::spawn(async move {
             loop {
-                sleep(Duration::from_secs(600)).await; // 10 minutes
+                sleep(Duration::from_secs(600)).await;
                 if let Ok(new_proxies) = fetch_online_proxies().await {
                     println!("\n🔄 Proxies updated: {} found.", new_proxies.len());
                     *p_list_clone.write().await = new_proxies;
@@ -268,13 +262,21 @@ async fn main() -> Result<()> {
     let shared_rx = Arc::new(Mutex::new(rx));
     let prefixes = Arc::new(config.prefixes);
 
-    // Generator
+    // Generator Task (Using user input 'target_count')
     let prefixes_clone = prefixes.clone();
     tokio::spawn(async move {
-        let mut rng = rand::thread_rng();
-        for _ in 0..TARGET_COUNT {
-            if let Some(prefix) = prefixes_clone.choose(&mut rng) {
-                let num = format!("98{}{}", prefix, generate_random_suffix());
+        // Changed from constant to variable
+        for _ in 0..target_count {
+            let num_opt = {
+                let mut rng = rand::thread_rng();
+                if let Some(prefix) = prefixes_clone.choose(&mut rng) {
+                    Some(format!("98{}{}", prefix, generate_random_suffix()))
+                } else {
+                    None
+                }
+            };
+
+            if let Some(num) = num_opt {
                 if tx.send(num).await.is_err() {
                     break;
                 }
@@ -282,7 +284,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Prepare Direct Client (Optimization: Build once, reuse many times)
     let direct_client_base = if mode == RunMode::Direct {
         Some(build_direct_client(&token)?)
     } else {
@@ -301,7 +302,6 @@ async fn main() -> Result<()> {
 
         let handle = tokio::spawn(async move {
             loop {
-                // Get next number
                 let phone_opt = {
                     let mut rx_guard = rx_clone.lock().await;
                     rx_guard.recv().await
@@ -309,26 +309,24 @@ async fn main() -> Result<()> {
 
                 let phone = match phone_opt {
                     Some(p) => p,
-                    None => break, // Channel empty
+                    None => break,
                 };
 
                 if mode == RunMode::Direct {
-                    // Fast path: Use existing client
                     if let Some(c) = &direct_client {
                         process_number(c, phone, &success_clone).await;
                     }
                 } else {
-                    // Proxy path
                     let mut selected_client = None;
                     
-                    // Retry Logic
                     for _ in 0..3 {
                         let proxy_addr = {
                             let r_guard = proxies_clone.read().await;
                             if r_guard.is_empty() { 
                                 None 
                             } else { 
-                                r_guard.choose(&mut rand::thread_rng()).cloned() 
+                                let mut rng = rand::thread_rng();
+                                r_guard.choose(&mut rng).cloned() 
                             }
                         };
 
@@ -338,7 +336,6 @@ async fn main() -> Result<()> {
                                 break;
                             }
                         } else {
-                            // No proxies available! Sleep briefly to avoid CPU spin
                             sleep(Duration::from_millis(1000)).await;
                             break;
                         }
@@ -353,7 +350,6 @@ async fn main() -> Result<()> {
         handles.push(handle);
     }
 
-    // Wait for completion
     for h in handles {
         let _ = h.await;
     }
