@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
-use rand::seq::SliceRandom;
+use rand::prelude::*; 
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,7 +60,8 @@ fn read_config() -> Result<AppConfig> {
 
 fn generate_random_suffix() -> String {
     let chars: Vec<char> = "1234567890".chars().collect();
-    let mut rng = rand::thread_rng();
+    // ✅ UPDATE: Use rand::rng()
+    let mut rng = rand::rng(); 
     chars.choose_multiple(&mut rng, 7).collect()
 }
 
@@ -81,14 +82,9 @@ async fn log_to_file(msg: String) {
 
 fn sanitize_proxy_url(raw: &str) -> String {
     let mut clean = raw.trim().to_string();
-    
     if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
     if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
-    
-    if !clean.contains("://") { 
-        return format!("socks5://{}", clean); 
-    }
-    
+    if !clean.contains("://") { return format!("socks5://{}", clean); }
     clean
 }
 
@@ -121,10 +117,7 @@ fn build_client(token: &str, proxy: Option<Proxy>, timeout_secs: u64) -> Result<
 
 async fn fetch_validate_and_build(token: String) -> Result<Vec<Client>> {
     println!("⏳ Initializing download sequence...");
-    
-    let fetcher = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let fetcher = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
     println!("📄 Getting sources from GitHub...");
     let sources_text = fetcher.get(SOURCE_OF_SOURCES_URL).send().await?.text().await?;
@@ -134,7 +127,6 @@ async fn fetch_validate_and_build(token: String) -> Result<Vec<Client>> {
         .collect();
 
     println!("🔗 Found {} sources. Downloading raw list concurrently...", source_urls.len());
-    
     let mut raw_proxies = HashSet::new();
     let mut download_tasks = Vec::new();
 
@@ -176,7 +168,6 @@ async fn fetch_validate_and_build(token: String) -> Result<Vec<Client>> {
         
         check_tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            
             let sanitized = sanitize_proxy_url(&proxy_str);
             if let Ok(proxy_obj) = Proxy::all(&sanitized) {
                 if let Ok(test_client) = build_client(&t_token, Some(proxy_obj.clone()), VALIDATION_TIMEOUT) {
@@ -193,11 +184,8 @@ async fn fetch_validate_and_build(token: String) -> Result<Vec<Client>> {
     }
 
     for t in check_tasks { let _ = t.await; }
-
-    // ✅ FIX: Explicitly specify type Vec<Client>
     let final_list: Vec<Client> = valid_clients.lock().await.drain(..).collect();
     println!("\n✅ Process Complete. Pool size: {} clients.", final_list.len());
-    
     Ok(final_list)
 }
 
@@ -205,7 +193,6 @@ fn read_local_proxies(token: &str) -> Result<Vec<Client>> {
     let file = File::open("socks5.txt").context("Could not open socks5.txt")?;
     let reader = BufReader::new(file);
     let mut clients = Vec::new();
-    
     println!("📁 Processing local proxies...");
     for line in reader.lines() {
         if let Ok(l) = line {
@@ -236,7 +223,6 @@ async fn process_number(
     if *success_counter.lock().await >= target { return; }
 
     let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
-
     let res1 = client.post(API_CHECK_APP)
         .header("Referer", "https://my.irancell.ir/invite")
         .json(&data).send().await;
@@ -272,9 +258,7 @@ async fn process_number(
                                     }
                                 }
                             },
-                            Err(e) => { 
-                                if debug_mode { log_to_file(format!("❌ [Step 2 Net] {}: {}", phone, e)).await; } 
-                            }
+                            Err(e) => { if debug_mode { log_to_file(format!("❌ [Step 2 Net] {}: {}", phone, e)).await; } }
                         }
                     }
                 }
@@ -283,9 +267,7 @@ async fn process_number(
                 if debug_mode { log_to_file(format!("❌ [HTTP {}] {}", resp.status(), phone)).await; }
             }
         },
-        Err(e) => { 
-            if debug_mode { log_to_file(format!("❌ [Step 1 Net] {}: {}", phone, e)).await; } 
-        }
+        Err(e) => { if debug_mode { log_to_file(format!("❌ [Step 1 Net] {}: {}", phone, e)).await; } }
     }
 }
 
@@ -360,7 +342,8 @@ async fn main() -> Result<()> {
             
             let client_clone = client.clone();
             let succ_clone = success_count.clone();
-            let prefix = prefixes.choose(&mut rand::thread_rng()).unwrap().clone();
+            // ✅ FIX: Use .choose(...) directly on the Vec/Slice reference
+            let prefix = prefixes.choose(&mut rand::rng()).unwrap().clone();
             let shutdown_clone = shutdown_tx.clone();
             
             let t = tokio::spawn(async move {
@@ -378,12 +361,12 @@ async fn main() -> Result<()> {
         let prefixes = Arc::new(config.prefixes);
         
         let prefixes_clone = prefixes.clone();
-        // ✅ FIX: Removed 'mut'
         let gen_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             loop {
                 if *gen_rx.borrow() { break; }
-                let prefix = prefixes_clone.choose(&mut rand::thread_rng()).unwrap();
+                // ✅ FIX: Use rand::rng()
+                let prefix = prefixes_clone.choose(&mut rand::rng()).unwrap();
                 let num = format!("98{}{}", prefix, generate_random_suffix());
                 if tx.send(num).await.is_err() { break; }
             }
@@ -395,7 +378,6 @@ async fn main() -> Result<()> {
             let pool_clone = client_pool.clone();
             let succ_clone = success_count.clone();
             let shutdown_clone = shutdown_tx.clone();
-            // ✅ FIX: Removed 'mut'
             let w_rx = shutdown_rx.clone();
 
             handles.push(tokio::spawn(async move {
@@ -407,8 +389,8 @@ async fn main() -> Result<()> {
                     let client_opt = {
                         let pool = pool_clone.read().await;
                         if !pool.is_empty() {
-                            let mut rng = rand::thread_rng();
-                            pool.choose(&mut rng).cloned()
+                            // ✅ FIX: Explicit cast to slice for .choose()
+                            pool.as_slice().choose(&mut rand::rng()).cloned()
                         } else { None }
                     };
 
