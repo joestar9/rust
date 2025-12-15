@@ -5,7 +5,7 @@ use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::fs::OpenOptions; // برای نوشتن در فایل
+use std::fs::OpenOptions;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use tokio::time::sleep;
 
 // --- Constants ---
 const CONFIG_FILE: &str = "config.json";
-const LOG_FILE: &str = "debug.log"; // 📄 فایل لاگ
+const LOG_FILE: &str = "debug.log";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.txt";
@@ -40,7 +40,7 @@ struct InviteData {
 struct AppConfig {
     token: Option<String>,
     prefixes: Vec<String>,
-    debug: Option<bool>, // ✅ سوییچ دیباگ
+    debug: Option<bool>,
 }
 
 // --- Helper Functions ---
@@ -76,12 +76,10 @@ fn prompt_input(prompt: &str) -> String {
     buffer.trim().to_string()
 }
 
-/// ✅ تابع لاگ کردن در فایل (Thread-Safe ساده)
 async fn log_to_file(msg: String) {
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
     let log_line = format!("[{}] {}\n", timestamp, msg);
     
-    // باز کردن فایل در حالت Append (اضافه کردن به ته فایل)
     let result = OpenOptions::new()
         .create(true)
         .append(true)
@@ -95,12 +93,27 @@ async fn log_to_file(msg: String) {
 // --- Proxy Logic ---
 
 async fn fetch_all_proxies_from_sources() -> Result<Vec<String>> {
+    println!("⏳ Initializing HTTP Client (System Proxy/VPN)...");
+    
     let client = Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30)) 
         .build()?;
 
-    println!("📄 Fetching source list from GitHub...");
-    let sources_text = client.get(SOURCE_OF_SOURCES_URL).send().await?.text().await?;
+    println!("📄 Connecting to GitHub: {}", SOURCE_OF_SOURCES_URL);
+    io::stdout().flush()?;
+
+    let sources_text = match client.get(SOURCE_OF_SOURCES_URL).send().await {
+        Ok(resp) => {
+            println!("✅ Connected to GitHub. Reading list...");
+            resp.text().await?
+        },
+        Err(e) => {
+            println!("❌ Error connecting to GitHub: {}", e);
+            println!("💡 Make sure your System VPN is ON.");
+            return Err(anyhow::Error::new(e));
+        }
+    };
+
     let source_urls: Vec<String> = sources_text
         .lines()
         .map(|l| l.trim().to_string())
@@ -114,8 +127,9 @@ async fn fetch_all_proxies_from_sources() -> Result<Vec<String>> {
 
     for url in source_urls {
         let c = client.clone();
+        let u = url.clone();
         let task = tokio::spawn(async move {
-            match c.get(&url).timeout(Duration::from_secs(10)).send().await {
+            match c.get(&u).timeout(Duration::from_secs(15)).send().await {
                 Ok(resp) => {
                     if let Ok(text) = resp.text().await {
                         let lines: Vec<String> = text.lines()
@@ -132,6 +146,7 @@ async fn fetch_all_proxies_from_sources() -> Result<Vec<String>> {
         tasks.push(task);
     }
 
+    println!("⏳ Waiting for downloads...");
     for task in tasks {
         if let Ok(Some(proxies)) = task.await {
             for p in proxies {
@@ -158,10 +173,38 @@ fn read_local_proxies() -> Result<Vec<String>> {
     Ok(unique_proxies.into_iter().collect())
 }
 
-async fn build_client_with_proxy(proxy_addr: &str, token: &str) -> Option<Client> {
-    let proxy = match Proxy::all(proxy_addr) {
+/// Helper function to fix and format proxy strings
+fn sanitize_proxy_url(raw: &str) -> String {
+    let mut clean = raw.trim().to_string();
+    
+    // Fix common typo "soks5" -> "socks5"
+    if clean.starts_with("soks5://") {
+        clean = clean.replace("soks5://", "socks5://");
+    }
+
+    // If it has no scheme (e.g. "1.1.1.1:80"), assume socks5
+    if !clean.contains("://") {
+        return format!("socks5://{}", clean);
+    }
+
+    clean
+}
+
+async fn build_client_with_proxy(proxy_addr: &str, token: &str, debug: bool) -> Option<Client> {
+    // 1. Sanitize the proxy URL
+    let proxy_str = sanitize_proxy_url(proxy_addr);
+
+    if debug {
+        // Print purely for debugging logic, remove in prod if too noisy
+        // println!("🔍 Testing Proxy: {}", proxy_str);
+    }
+
+    let proxy = match Proxy::all(&proxy_str) {
         Ok(p) => p,
-        Err(_) => return None,
+        Err(e) => {
+            if debug { log_to_file(format!("❌ Bad Proxy Format [{}]: {}", proxy_str, e)).await; }
+            return None;
+        }
     };
 
     let mut headers = reqwest::header::HeaderMap::new();
@@ -176,17 +219,24 @@ async fn build_client_with_proxy(proxy_addr: &str, token: &str) -> Option<Client
         headers.insert("Authorization", val);
     }
 
+    // 2. Build Client with tight timeout
     let client_builder = Client::builder()
         .default_headers(headers)
         .proxy(proxy)
-        .timeout(Duration::from_secs(10)); 
+        .timeout(Duration::from_secs(6)); // 6 seconds is enough for a handshake
 
     match client_builder.build() {
         Ok(client) => {
-            if client.get(TARGET_CHECK_URL).send().await.is_ok() {
-                Some(client)
-            } else {
-                None
+            // 3. Health Check
+            match client.get(TARGET_CHECK_URL).send().await {
+                Ok(_) => {
+                    // if debug { println!("✅ Proxy Healthy: {}", proxy_str); }
+                    Some(client)
+                },
+                Err(_) => {
+                    // if debug { println!("💀 Proxy Dead: {}", proxy_str); }
+                    None
+                }
             }
         }
         Err(_) => None,
@@ -211,20 +261,17 @@ fn build_direct_client(token: &str) -> Result<Client> {
         .context("Failed to build direct client")
 }
 
-// --- Main Logic with Debugging ---
-
 async fn process_number(
     client: &Client,
     phone: String,
     success_counter: &Arc<Mutex<usize>>,
-    debug_mode: bool, // ✅ دریافت وضعیت دیباگ
+    debug_mode: bool,
 ) {
     let data = InviteData {
         application_name: "NGMI".to_string(),
         friend_number: phone.clone(),
     };
 
-    // --- Request 1 ---
     let res1 = client
         .post(API_CHECK_APP)
         .header("Referer", "https://my.irancell.ir/invite")
@@ -241,7 +288,6 @@ async fn process_number(
                 match serde_json::from_str::<Value>(&text) {
                     Ok(body) => {
                          if body["message"] == "done" {
-                            // --- Request 2 ---
                             let res2 = client
                                 .post(API_SEND_INVITE)
                                 .header("Referer", "https://my.irancell.ir/invite/confirm")
@@ -261,57 +307,38 @@ async fn process_number(
                                                     println!("✅ Invite sent: {}", phone);
                                                     let mut lock = success_counter.lock().await;
                                                     *lock += 1;
-                                                } else {
-                                                    // Failed at final step
-                                                    if debug_mode {
-                                                        log_to_file(format!("❌ [Step 2 Logic Fail] {}: Response: {}", phone, text2)).await;
-                                                    }
+                                                } else if debug_mode {
+                                                    log_to_file(format!("❌ [Step 2 Logic] {}: {}", phone, text2)).await;
                                                 }
                                             },
                                             Err(_) => {
-                                                if debug_mode {
-                                                    log_to_file(format!("❌ [Step 2 JSON Fail] {}: Raw: {}", phone, text2)).await;
-                                                }
-                                            },
+                                                if debug_mode { log_to_file(format!("❌ [Step 2 JSON] {}: {}", phone, text2)).await; }
+                                            }
                                         }
-                                    } else {
-                                        // Step 2 HTTP Error
-                                        if debug_mode {
-                                            log_to_file(format!("❌ [Step 2 HTTP {}] {}: Body: {}", status2, phone, text2)).await;
-                                        }
+                                    } else if debug_mode {
+                                        log_to_file(format!("❌ [Step 2 HTTP {}] {}: {}", status2, phone, text2)).await;
                                     }
                                 },
                                 Err(e) => {
-                                    if debug_mode {
-                                        log_to_file(format!("❌ [Step 2 Net Error] {}: {}", phone, e)).await;
-                                    }
+                                    if debug_mode { log_to_file(format!("❌ [Step 2 Net] {}: {}", phone, e)).await; }
                                 },
                             }
-                        } else {
-                             // "message" != "done" (e.g., user already exists)
-                             // This is normal, but logging it helps debug logic
-                             if debug_mode {
-                                 log_to_file(format!("⚠️ [Step 1 Not Done] {}: Response: {}", phone, text)).await;
-                             }
                         }
                     },
                     Err(_) => {
-                        if debug_mode {
-                             log_to_file(format!("❌ [Step 1 JSON Fail] {}: Raw: {}", phone, text)).await;
-                        }
+                        if debug_mode { log_to_file(format!("❌ [Step 1 JSON] {}: {}", phone, text)).await; }
                     },
                 }
             } else {
-                // HTTP Error (400, 401, 403, 500)
-                println!("❌ HTTP Error {}: {}", status, phone); // Show in console too
+                println!("❌ Request Failed {}: {}", status, phone);
                 if debug_mode {
-                    log_to_file(format!("❌ [Step 1 HTTP {}] {}: Body: {}", status, phone, text)).await;
+                    log_to_file(format!("❌ [Step 1 HTTP {}] {}: {}", status, phone, text)).await;
                 }
             }
         },
         Err(e) => {
             if debug_mode {
-                log_to_file(format!("❌ [Step 1 Net Error] {}: {}", phone, e)).await;
+                log_to_file(format!("❌ [Step 1 Net] {}: {}", phone, e)).await;
             }
         }
     }
@@ -319,12 +346,14 @@ async fn process_number(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // --- 1. Config ---
+    #[cfg(windows)]
+    let _ = yansi::Paint::enable_windows_ascii();
+
     let config = read_config()?;
-    let debug_mode = config.debug.unwrap_or(false); // پیش‌فرض خاموش
+    let debug_mode = config.debug.unwrap_or(false);
 
     if debug_mode {
-        println!("🐞 Debug Mode is ON. Check '{}' for errors.", LOG_FILE);
+        println!("🐞 Debug Mode is ON. Logs: '{}'", LOG_FILE);
         log_to_file("--- SESSION STARTED ---".to_string()).await;
     }
 
@@ -337,10 +366,9 @@ async fn main() -> Result<()> {
     let count_input = prompt_input("🎯 Target Count: ");
     let target_count: usize = count_input.parse().unwrap_or(1000);
 
-    // --- 2. Mode ---
     println!("\n✨ Select Mode:");
     println!("1) Direct Mode (Your IP/VPN) 🌐");
-    println!("2) Auto Proxy Mode (GitHub Source of Sources) 🔄");
+    println!("2) Auto Proxy Mode (GitHub Source) 🔄");
     println!("3) Local Proxy Mode (socks5.txt) 📁");
     
     let mode_input = prompt_input("Choice [1-3]: ");
@@ -353,7 +381,6 @@ async fn main() -> Result<()> {
     let workers_input = prompt_input("👷 Number of Workers: ");
     let worker_count: usize = workers_input.parse().unwrap_or(5);
 
-    // --- 3. Proxy Init ---
     let proxy_list: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
 
     if mode == RunMode::LocalProxy {
@@ -361,12 +388,18 @@ async fn main() -> Result<()> {
         println!("📁 Loaded {} unique local proxies.", loaded.len());
         *proxy_list.write().await = loaded;
     } else if mode == RunMode::AutoProxy {
+        println!("🚀 Starting Proxy Fetch Process...");
         match fetch_all_proxies_from_sources().await {
             Ok(proxies) => {
-                println!("📥 Aggregated {} unique proxies from all sources.", proxies.len());
+                if proxies.is_empty() {
+                    return Err(anyhow!("No proxies found. Check VPN/Connection."));
+                }
+                println!("📥 Aggregated {} unique proxies.", proxies.len());
                 *proxy_list.write().await = proxies;
             }
-            Err(e) => eprintln!("❌ Failed to fetch proxies: {}", e),
+            Err(e) => {
+                return Err(e);
+            }
         }
 
         let p_list_clone = proxy_list.clone();
@@ -374,21 +407,22 @@ async fn main() -> Result<()> {
             loop {
                 sleep(Duration::from_secs(600)).await;
                 if let Ok(new_proxies) = fetch_all_proxies_from_sources().await {
-                    println!("\n🔄 Proxies updated: {} unique found.", new_proxies.len());
-                    *p_list_clone.write().await = new_proxies;
+                    if !new_proxies.is_empty() {
+                        println!("\n🔄 Auto-Update: {} proxies found.", new_proxies.len());
+                        *p_list_clone.write().await = new_proxies;
+                    }
                 }
             }
         });
     }
 
-    println!("🚀 Start: {}", Local::now().format("%c"));
+    println!("🚀 Start processing {} numbers at: {}", target_count, Local::now().format("%c"));
     let success_count = Arc::new(Mutex::new(0));
     
     let (tx, rx) = mpsc::channel::<String>(100);
     let shared_rx = Arc::new(Mutex::new(rx));
     let prefixes = Arc::new(config.prefixes);
 
-    // Generator
     let prefixes_clone = prefixes.clone();
     tokio::spawn(async move {
         for _ in 0..target_count {
@@ -400,30 +434,25 @@ async fn main() -> Result<()> {
                     None
                 }
             };
-
             if let Some(num) = num_opt {
-                if tx.send(num).await.is_err() {
-                    break;
-                }
+                if tx.send(num).await.is_err() { break; }
             }
         }
     });
 
     let direct_client_base = if mode == RunMode::Direct {
         Some(build_direct_client(&token)?)
-    } else {
-        None
-    };
+    } else { None };
 
-    // Workers
     let mut handles = Vec::new();
 
-    for _ in 0..worker_count {
+    for id in 0..worker_count {
         let rx_clone = shared_rx.clone();
         let proxies_clone = proxy_list.clone();
         let token_clone = token.clone();
         let success_clone = success_count.clone();
         let direct_client = direct_client_base.clone();
+        let current_mode = mode;
 
         let handle = tokio::spawn(async move {
             loop {
@@ -437,13 +466,15 @@ async fn main() -> Result<()> {
                     None => break,
                 };
 
-                if mode == RunMode::Direct {
+                if current_mode == RunMode::Direct {
                     if let Some(c) = &direct_client {
                         process_number(c, phone, &success_clone, debug_mode).await;
                     }
                 } else {
                     let mut selected_client = None;
-                    for _ in 0..3 {
+                    let mut attempt = 0;
+                    // Retry up to 5 times to find a working proxy
+                    while attempt < 5 {
                         let proxy_addr = {
                             let r_guard = proxies_clone.read().await;
                             if r_guard.is_empty() { None } 
@@ -454,18 +485,22 @@ async fn main() -> Result<()> {
                         };
 
                         if let Some(p) = proxy_addr {
-                            if let Some(c) = build_client_with_proxy(&p, &token_clone).await {
+                             // Pass debug_mode to build_client
+                             if let Some(c) = build_client_with_proxy(&p, &token_clone, debug_mode).await {
                                 selected_client = Some(c);
                                 break;
                             }
                         } else {
-                            sleep(Duration::from_millis(1000)).await;
+                            sleep(Duration::from_millis(2000)).await;
                             break;
                         }
+                        attempt += 1;
                     }
 
                     if let Some(client) = selected_client {
                         process_number(&client, phone, &success_clone, debug_mode).await;
+                    } else if debug_mode {
+                        log_to_file(format!("⚠️ [Worker {}] Failed to find healthy proxy for {}", id, phone)).await;
                     }
                 }
             }
