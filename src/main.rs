@@ -18,7 +18,8 @@ const CONFIG_FILE: &str = "config.json";
 const LOG_FILE: &str = "debug.log";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
-const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.txt";
+// ✅ LINK UPDATED to new JSON source
+const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.json";
 const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
 
 // --- Enums & Structs ---
@@ -27,6 +28,14 @@ enum RunMode {
     Direct,
     AutoProxy,
     LocalProxy,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ProxyFilter {
+    All,
+    Http,
+    Socks4,
+    Socks5,
 }
 
 enum ProxyStatus {
@@ -46,6 +55,16 @@ struct AppConfig {
     token: Option<String>,
     prefixes: Vec<String>,
     debug: Option<bool>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ProxySourceConfig {
+    #[serde(default)]
+    http: Vec<String>,
+    #[serde(default)]
+    socks4: Vec<String>,
+    #[serde(default)]
+    socks5: Vec<String>,
 }
 
 // --- Helper Functions ---
@@ -82,24 +101,40 @@ async fn log_debug(msg: String) {
     if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
 }
 
-/// ✅ CRITICAL UPDATE: Force Remote DNS (socks5h)
-fn sanitize_proxy_url(raw: &str) -> String {
+fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     let mut clean = raw.trim().to_string();
     
     // Fix common typos
-    if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5h://"); }
-    if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5h://"); }
+    if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
+    if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
     
-    // Convert standard socks5 to socks5h for better connectivity
-    if clean.starts_with("socks5://") {
-        clean = clean.replace("socks5://", "socks5h://");
+    // Upgrade socks5 to socks5h for remote DNS
+    if default_proto == "socks5" || default_proto == "socks5h" {
+        if clean.starts_with("socks5://") {
+            return clean.replace("socks5://", "socks5h://");
+        }
+        if !clean.contains("://") {
+            return format!("socks5h://{}", clean);
+        }
     }
 
-    // Default to socks5h if no scheme provided
+    if !clean.contains("://") { 
+        return format!("{}://{}", default_proto, clean); 
+    }
+    
+    clean
+}
+
+fn sanitize_proxy_url_generic(raw: &str) -> String {
+    // Used for local file where type is unknown, assumes socks5h default or respects scheme
+    let mut clean = raw.trim().to_string();
+    if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5h://"); }
+    if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5h://"); }
+    if clean.starts_with("socks5://") { clean = clean.replace("socks5://", "socks5h://"); }
+    
     if !clean.contains("://") { 
         return format!("socks5h://{}", clean); 
     }
-    
     clean
 }
 
@@ -120,7 +155,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
         .tcp_nodelay(true)
         .cookie_store(true)
         .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(15)); // 15s timeout is fair for proxies
+        .timeout(Duration::from_secs(15));
 
     if let Some(p) = proxy {
         builder = builder.proxy(p);
@@ -129,49 +164,74 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     builder.build().context("Failed to build client")
 }
 
-// --- Fetch Logic ---
+// --- Fetch Logic (Updated with Filter) ---
 
-async fn fetch_proxies_list(_token: String) -> Result<Vec<String>> {
-    println!("⏳ Downloading proxy list...");
-    // Use a temporary client for fetching list (System Proxy)
+async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<String>> {
+    println!("⏳ Connecting to GitHub to fetch proxy sources...");
     let fetcher = Client::builder().timeout(Duration::from_secs(30)).build()?;
     
-    // 1. Get List of Sources
-    let sources_text = match fetcher.get(SOURCE_OF_SOURCES_URL).send().await {
+    let json_text = match fetcher.get(SOURCE_OF_SOURCES_URL).send().await {
         Ok(res) => res.text().await?,
-        Err(e) => return Err(anyhow!("Failed to fetch source list: {}", e)),
+        Err(e) => return Err(anyhow!("Failed to fetch source JSON: {}", e)),
     };
-    
-    let source_urls: Vec<String> = sources_text.lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && l.starts_with("http"))
-        .collect();
 
-    println!("🔗 Found {} sources. Downloading raw proxies...", source_urls.len());
+    let sources: ProxySourceConfig = match serde_json::from_str(&json_text) {
+        Ok(s) => s,
+        Err(e) => return Err(anyhow!("Invalid JSON format in source file: {}", e)),
+    };
 
     let mut raw_proxies = HashSet::new();
     let mut tasks = Vec::new();
 
-    // 2. Fetch each source concurrently
-    for url in source_urls {
-        let c = fetcher.clone();
-        let u = url.clone();
-        tasks.push(tokio::spawn(async move {
-            if let Ok(resp) = c.get(&u).timeout(Duration::from_secs(15)).send().await {
-                if let Ok(text) = resp.text().await { return Some(text); }
+    // Helper to spawn download tasks
+    let spawn_download = |url: String, proto: &'static str, client: Client| {
+        tokio::spawn(async move {
+            let mut found = Vec::new();
+            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(15)).send().await {
+                if let Ok(text) = resp.text().await {
+                    for line in text.lines() {
+                        let p = line.trim();
+                        if !p.is_empty() && p.contains(':') {
+                            found.push(format_proxy_url(p, proto));
+                        }
+                    }
+                }
             }
-            None
-        }));
+            found
+        })
+    };
+
+    // Apply Filter Logic
+    match filter {
+        ProxyFilter::All => {
+            println!("🌐 Fetching ALL proxy types (HTTP, SOCKS4, SOCKS5)...");
+            for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
+            for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
+            for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
+        },
+        ProxyFilter::Http => {
+            println!("🌐 Fetching ONLY HTTP proxies...");
+            for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
+        },
+        ProxyFilter::Socks4 => {
+            println!("🌐 Fetching ONLY SOCKS4 proxies...");
+            for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
+        },
+        ProxyFilter::Socks5 => {
+            println!("🌐 Fetching ONLY SOCKS5 proxies...");
+            for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
+        },
     }
 
+    if tasks.is_empty() {
+        return Err(anyhow!("No sources found for the selected proxy type in the JSON file."));
+    }
+
+    println!("⬇️  Downloading from {} sources concurrently...", tasks.len());
     for task in tasks {
-        if let Ok(Some(text)) = task.await {
-            for line in text.lines() {
-                let p = line.trim();
-                // Basic validation: must have IP structure
-                if !p.is_empty() && (p.contains(':')) {
-                    raw_proxies.insert(p.to_string());
-                }
+        if let Ok(proxies) = task.await {
+            for p in proxies {
+                raw_proxies.insert(p);
             }
         }
     }
@@ -185,10 +245,13 @@ fn read_local_list() -> Result<Vec<String>> {
     let file = File::open("socks5.txt").context("Could not open socks5.txt")?;
     let reader = BufReader::new(file);
     let mut proxies = Vec::new();
+    println!("📁 Processing local proxies...");
     for line in reader.lines() {
         if let Ok(l) = line {
             let p = l.trim().to_string();
-            if !p.is_empty() { proxies.push(p); }
+            if !p.is_empty() { 
+                proxies.push(sanitize_proxy_url_generic(&p)); 
+            }
         }
     }
     proxies.shuffle(&mut rand::rng());
@@ -218,7 +281,6 @@ async fn run_worker_robust(
     loop {
         if *shutdown_rx.borrow() { break; }
 
-        // Feedback Loop
         while let Ok(status) = status_rx.try_recv() {
             match status {
                 ProxyStatus::Healthy | ProxyStatus::SoftFail => {
@@ -230,37 +292,32 @@ async fn run_worker_robust(
             }
         }
 
-        // Switch Logic
         if consecutive_errors >= MAX_RETRIES_BEFORE_SWITCH {
             if debug_mode { 
-                log_debug(format!("♻️ Worker {} switching. Failed Proxy: {}", worker_id, current_proxy_addr)).await; 
+                log_debug(format!("♻️ Worker {} switching. Failed: {}", worker_id, current_proxy_addr)).await; 
             }
             current_client = None; 
             consecutive_errors = 0; 
         }
 
-        // Setup New Client
         if current_client.is_none() {
             let mut pool = proxy_pool.lock().await;
-            if let Some(proxy_raw) = pool.pop() {
-                // IMPORTANT: sanitize_proxy_url now forces socks5h://
-                let sanitized = sanitize_proxy_url(&proxy_raw);
-                if let Ok(proxy_obj) = Proxy::all(&sanitized) {
+            if let Some(proxy_url) = pool.pop() {
+                // proxy_url is already formatted correctly by fetch_proxies_list
+                if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
                         current_client = Some(c);
-                        current_proxy_addr = proxy_raw;
+                        current_proxy_addr = proxy_url;
                         consecutive_errors = 0;
                     }
                 }
             } else {
                 drop(pool);
-                // Pool is empty, wait a bit
                 sleep(Duration::from_secs(5)).await;
                 continue;
             }
         }
 
-        // Execute
         if let Some(client) = current_client.clone() {
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
@@ -297,7 +354,6 @@ async fn perform_invite(
 
     let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
 
-    // Request 1
     let res1 = client.post(API_CHECK_APP)
         .header("Referer", "https://my.irancell.ir/invite")
         .json(&data).send().await;
@@ -306,7 +362,6 @@ async fn perform_invite(
         Ok(resp) => {
             let status_code = resp.status();
             
-            // Hard failures (Proxy rejected or Banned)
             if status_code == 403 || status_code == 429 || status_code == 407 {
                 return ProxyStatus::HardFail; 
             }
@@ -315,7 +370,6 @@ async fn perform_invite(
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                      if body["message"] == "done" {
-                        // Request 2
                         let res2 = client.post(API_SEND_INVITE)
                             .header("Referer", "https://my.irancell.ir/invite/confirm")
                             .json(&data).send().await;
@@ -348,7 +402,6 @@ async fn perform_invite(
             }
         },
         Err(e) => {
-            // This is the most common error with bad proxies
             if debug_mode { log_debug(format!("Worker {} Net Error: {}", id, e)).await; }
             return ProxyStatus::HardFail; 
         }
@@ -375,12 +428,31 @@ async fn main() -> Result<()> {
 
     println!("\n✨ Select Mode:");
     println!("1) Direct Mode (No Proxy) 🌐");
-    println!("2) Auto Proxy Mode (Smart Rotation - Force Remote DNS) 🚀");
-    println!("3) Local Proxy Mode (Smart Rotation - Force Remote DNS) 📁");
+    println!("2) Auto Proxy Mode (JSON Sources) 🚀");
+    println!("3) Local Proxy Mode (socks5.txt) 📁");
     
     let mode_input = prompt_input("Choice [1-3]: ");
+    
+    // --- Logic for Proxy Selection ---
+    let mut proxy_filter = ProxyFilter::All;
+    
     let mode = match mode_input.as_str() {
-        "2" => RunMode::AutoProxy,
+        "2" => {
+            println!("\n🔍 Select Proxy Protocol:");
+            println!("1) All (Default) 🌍");
+            println!("2) HTTP/HTTPS 🌐");
+            println!("3) SOCKS4 🔌");
+            println!("4) SOCKS5 (Remote DNS) 🛡️");
+            
+            let filter_input = prompt_input("Choice [1-4]: ");
+            proxy_filter = match filter_input.as_str() {
+                "2" => ProxyFilter::Http,
+                "3" => ProxyFilter::Socks4,
+                "4" => ProxyFilter::Socks5,
+                _ => ProxyFilter::All,
+            };
+            RunMode::AutoProxy
+        },
         "3" => RunMode::LocalProxy,
         _ => RunMode::Direct,
     };
@@ -398,7 +470,8 @@ async fn main() -> Result<()> {
         raw_pool = read_local_list()?;
         println!("📦 Loaded {} local proxies.", raw_pool.len());
     } else if mode == RunMode::AutoProxy {
-        raw_pool = fetch_proxies_list(token.clone()).await?;
+        // Pass the filter to fetcher
+        raw_pool = fetch_proxies_list(token.clone(), proxy_filter).await?;
         println!("📦 Downloaded {} proxies.", raw_pool.len());
     } else {
         raw_pool.push("Direct".to_string());
@@ -462,4 +535,3 @@ async fn main() -> Result<()> {
     println!("\n📊 Final Results: {} Successes", *success_counter.lock().await);
     Ok(())
 }
-
