@@ -1,4 +1,4 @@
-چuse anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
