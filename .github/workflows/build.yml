@@ -1,6 +1,5 @@
-name: Build Rust Application (2025 Standard)
+name: Build 64-bit Only
 
-# این ورک‌فلو با هر بار Push روی شاخه اصلی یا به صورت دستی اجرا می‌شود
 on:
   push:
     branches: [ "main", "master" ]
@@ -11,62 +10,50 @@ env:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build on ${{ matrix.os }} (64-bit)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # تنظیمات بیلد لینوکس
+          # ✅ Linux 64-bit (x86_64)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: irancell_invite_linux_x64
+            artifact_name: irancell_pro_invite_linux_x64
             executable_name: irancell_pro_invite
           
-          # تنظیمات بیلد ویندوز
+          # ✅ Windows 64-bit (x86_64)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: irancell_invite_windows_x64.exe
+            artifact_name: irancell_pro_invite_windows_x64.exe
             executable_name: irancell_pro_invite.exe
 
     steps:
-    # 1. دریافت آخرین کدها از مخزن
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # 2. نصب Rust Toolchain (آخرین نسخه پایدار)
     - name: Install Rust Toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ matrix.target }}
 
-    # 3. کش کردن وابستگی‌ها برای سرعت بیشتر بیلد (استاندارد مدرن)
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
 
-    # 4. بیلد پروژه با فلگ ریلیز (بهینه شده)
     - name: Build Release
       run: cargo build --release --target ${{ matrix.target }}
 
-    # 5. آماده‌سازی فایل‌ها برای آپلود (تغییر نام و جابجایی)
     - name: Prepare Artifacts
       shell: bash
       run: |
         mkdir release_pack
         
-        # کپی فایل اجرایی
-        if [ "${{ matrix.os }}" == "windows-latest" ]; then
-          cp target/${{ matrix.target }}/release/${{ matrix.executable_name }} release_pack/${{ matrix.artifact_name }}
-        else
-          cp target/${{ matrix.target }}/release/${{ matrix.executable_name }} release_pack/${{ matrix.artifact_name }}
-        fi
-        
-        # کپی فایل کانفیگ نمونه (اگر وجود دارد)
+        cp target/${{ matrix.target }}/release/${{ matrix.executable_name }} release_pack/${{ matrix.artifact_name }}
+
         if [ -f config.json ]; then
           cp config.json release_pack/
         fi
 
-    # 6. آپلود خروجی نهایی در بخش Artifacts گیت‌هاب
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
