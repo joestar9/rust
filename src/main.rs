@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
-use rand::prelude::*;
+use rand::prelude::*; // Rand 0.9 syntax
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,15 +13,12 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, watch};
 use tokio::time::sleep;
 
-// --- Constants ---
+// --- Constants (Exactly matching Python) ---
 const CONFIG_FILE: &str = "config.json";
 const LOG_FILE: &str = "debug.log";
-const PROXY_ERROR_FILE: &str = "proxy_errors.log"; // 📄 لاگ مخصوص خطای پراکسی
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.txt";
-const TARGET_CHECK_URL: &str = "https://my.irancell.ir/invite"; 
-const VALIDATION_TIMEOUT: u64 = 10; // افزایش تایم‌اوت تست به ۱۰ ثانیه برای اطمینان
 
 // --- Structs ---
 
@@ -58,10 +55,12 @@ fn read_config() -> Result<AppConfig> {
     Ok(config)
 }
 
+/// Exact logic of Python's: ''.join(random.sample(chars, 7))
 fn generate_random_suffix() -> String {
     let chars: Vec<char> = "1234567890".chars().collect();
     let mut rng = rand::rng(); 
-    chars.choose_multiple(&mut rng, 7).collect()
+    // choose_multiple guarantees unique elements, same as random.sample
+    chars.choose_multiple(&mut rng, 7).into_iter().collect()
 }
 
 fn prompt_input(prompt: &str) -> String {
@@ -79,30 +78,24 @@ async fn log_debug(msg: String) {
     if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
 }
 
-async fn log_proxy_error(proxy: &str, error: &str) {
-    let timestamp = Local::now().format("%H:%M:%S");
-    let log_line = format!("[{}] Proxy: {} | Error: {}\n", timestamp, proxy, error);
-    let result = OpenOptions::new().create(true).append(true).open(PROXY_ERROR_FILE);
-    if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
-}
-
 fn sanitize_proxy_url(raw: &str) -> String {
     let mut clean = raw.trim().to_string();
-    // Fix typos
     if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
     if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
-    // Default to socks5 if no scheme provided (common in lists)
     if !clean.contains("://") { return format!("socks5://{}", clean); }
     clean
 }
 
 // --- Client Factory ---
 
-fn build_client(token: &str, proxy: Option<Proxy>, timeout_secs: u64) -> Result<Client> {
+fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
+    // Setting default headers exactly as in Python "header_has_app"
+    // Note: Referer is dynamic and set per request.
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
     headers.insert("Accept-Language", "fa".parse().unwrap());
+    // reqwest handles Accept-Encoding automatically (gzip, br, etc.)
     headers.insert("Origin", "https://my.irancell.ir".parse().unwrap());
     headers.insert("x-app-version", "9.62.0".parse().unwrap());
     headers.insert("Authorization", reqwest::header::HeaderValue::from_str(token)?);
@@ -110,10 +103,9 @@ fn build_client(token: &str, proxy: Option<Proxy>, timeout_secs: u64) -> Result<
 
     let mut builder = Client::builder()
         .default_headers(headers)
-        .tcp_nodelay(true)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(50) // Allow high concurrency per host
-        .timeout(Duration::from_secs(timeout_secs));
+        .tcp_nodelay(true) // Optimization for speed
+        .cookie_store(true) // Python aiohttp session stores cookies, so we must too
+        .timeout(Duration::from_secs(20));
 
     if let Some(p) = proxy {
         builder = builder.proxy(p);
@@ -122,11 +114,12 @@ fn build_client(token: &str, proxy: Option<Proxy>, timeout_secs: u64) -> Result<
     builder.build().context("Failed to build client")
 }
 
-// --- Detailed Proxy Validation ---
+// --- Proxy Fetching (NO CHECK as requested) ---
 
-async fn fetch_and_validate_strict(token: String) -> Result<Vec<(String, Client)>> {
+async fn fetch_proxies_no_check(token: String) -> Result<Vec<(String, Client)>> {
     println!("⏳ Downloading proxy list...");
     
+    // Use system proxy/VPN to fetch list
     let fetcher = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let sources_text = fetcher.get(SOURCE_OF_SOURCES_URL).send().await?.text().await?;
     let source_urls: Vec<String> = sources_text.lines()
@@ -160,67 +153,27 @@ async fn fetch_and_validate_strict(token: String) -> Result<Vec<(String, Client)
     }
 
     let total = raw_proxies.len();
-    println!("📦 Testing {} proxies individually. Errors logged to '{}'...", total, PROXY_ERROR_FILE);
+    println!("📦 Found {} proxies. Building workers immediately (No Health Check)...", total);
     
-    // Clear old error log
-    File::create(PROXY_ERROR_FILE)?; 
-
-    // We use a semaphore to limit simultaneous CHECKS, but we store specific clients
-    let semaphore = Arc::new(Semaphore::new(300));
-    let valid_pairs = Arc::new(Mutex::new(Vec::new()));
-    let mut check_tasks = Vec::new();
-
+    let mut clients = Vec::new();
     for proxy_raw in raw_proxies {
-        let sem = semaphore.clone();
-        let output = valid_pairs.clone();
-        let t_token = token.clone();
-        let p_raw = proxy_raw.clone();
-
-        check_tasks.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let sanitized = sanitize_proxy_url(&p_raw);
-            
-            match Proxy::all(&sanitized) {
-                Ok(proxy_obj) => {
-                    // Try to build client
-                    match build_client(&t_token, Some(proxy_obj), VALIDATION_TIMEOUT) {
-                        Ok(client) => {
-                            // Try to Connect
-                            match client.head(TARGET_CHECK_URL).send().await {
-                                Ok(_) => {
-                                    // SUCCESS!
-                                    output.lock().await.push((p_raw, client));
-                                    print!("+");
-                                    let _ = io::stdout().flush();
-                                },
-                                Err(e) => {
-                                    // LOG CONNECTION ERROR
-                                    log_proxy_error(&p_raw, &e.to_string()).await;
-                                    print!("-");
-                                    let _ = io::stdout().flush();
-                                }
-                            }
-                        },
-                        Err(e) => log_proxy_error(&p_raw, &format!("Build error: {}", e)).await,
-                    }
-                },
-                Err(e) => log_proxy_error(&p_raw, &format!("Bad Format: {}", e)).await,
+        let sanitized = sanitize_proxy_url(&proxy_raw);
+        if let Ok(proxy_obj) = Proxy::all(&sanitized) {
+            // Build client for this specific proxy
+            if let Ok(client) = build_client(&token, Some(proxy_obj)) {
+                clients.push((proxy_raw, client));
             }
-        }));
+        }
     }
-
-    for t in check_tasks { let _ = t.await; }
     
-    let result = valid_pairs.lock().await.drain(..).collect();
-    println!("\n");
-    Ok(result)
+    Ok(clients)
 }
 
-fn read_local_strict(token: &str) -> Result<Vec<(String, Client)>> {
+fn read_local_no_check(token: &str) -> Result<Vec<(String, Client)>> {
     let file = File::open("socks5.txt").context("Could not open socks5.txt")?;
     let reader = BufReader::new(file);
-    let mut valid = Vec::new();
-    println!("📁 Processing local proxies...");
+    let mut clients = Vec::new();
+    println!("📁 Processing local proxies (No Health Check)...");
     
     for line in reader.lines() {
         if let Ok(l) = line {
@@ -228,19 +181,18 @@ fn read_local_strict(token: &str) -> Result<Vec<(String, Client)>> {
             if !p_raw.is_empty() {
                 let sanitized = sanitize_proxy_url(&p_raw);
                 if let Ok(p_obj) = Proxy::all(&sanitized) {
-                    if let Ok(c) = build_client(token, Some(p_obj), 15) {
-                        valid.push((p_raw, c));
+                    if let Ok(c) = build_client(token, Some(p_obj)) {
+                        clients.push((p_raw, c));
                     }
                 }
             }
         }
     }
-    Ok(valid)
+    Ok(clients)
 }
 
-// --- Worker Logic ---
+// --- Worker Logic (Exact Python Replication) ---
 
-/// This runs INSIDE a worker. It uses ONE client (one proxy) and launches multiple concurrent requests.
 async fn run_worker_with_proxy(
     worker_id: usize,
     proxy_name: String,
@@ -252,17 +204,16 @@ async fn run_worker_with_proxy(
     shutdown_rx: watch::Receiver<bool>,
     debug_mode: bool
 ) {
-    // Semaphore restricts concurrency PER WORKER (PER PROXY)
+    // This Semaphore mimics Python's `asyncio.Semaphore(10)` but per worker
     let sem = Arc::new(Semaphore::new(concurrency_limit));
     let mut tasks = Vec::new();
 
     loop {
         if *shutdown_rx.borrow() { break; }
 
-        // Clean up finished tasks
         tasks.retain(|h: &tokio::task::JoinHandle<()>| !h.is_finished());
 
-        // Try to acquire permission to send a request
+        // Acquire permit to respect concurrency limit
         if let Ok(permit) = sem.clone().acquire_owned().await {
             let c = client.clone();
             let p_ref = prefixes.clone();
@@ -271,20 +222,17 @@ async fn run_worker_with_proxy(
             let mut s_rx = shutdown_rx.clone();
             
             tasks.push(tokio::spawn(async move {
-                let _p = permit; // Hold permit until done
-                
-                // Double check shutdown
+                let _p = permit; // Hold permit
                 if *s_rx.borrow() { return; }
 
-                // Generate Number
+                // Logic: 98 + prefix + 7 random digits
                 let prefix = p_ref.choose(&mut rand::rng()).unwrap();
                 let phone = format!("98{}{}", prefix, generate_random_suffix());
 
-                // Process
                 perform_invite(worker_id, &p_name, &c, phone, &s_ref, debug_mode, target).await;
             }));
         } else {
-            break; // Semaphore closed
+            break; 
         }
     }
 }
@@ -298,37 +246,49 @@ async fn perform_invite(
     debug_mode: bool,
     target: usize
 ) {
+    // Check if we hit target
     if *success_counter.lock().await >= target { return; }
 
     let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
 
+    // --- STEP 1: Check App ---
+    // Python: headers=header_has_app (Referer: .../invite)
     let res1 = client.post(API_CHECK_APP)
-        .header("Referer", "https://my.irancell.ir/invite")
+        .header("Referer", "https://my.irancell.ir/invite") 
         .json(&data).send().await;
 
     match res1 {
         Ok(resp) => {
-            if resp.status().is_success() {
+            // Python: if res1.status == 200 ...
+            if resp.status().as_u16() == 200 { 
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
+                     // Python: ... and response1.get("message") == "done"
                      if body["message"] == "done" {
+                        
+                        // --- STEP 2: Send Invite ---
+                        // Python: headers=header_invite_to_MyIransell (Referer: .../invite/confirm)
                         let res2 = client.post(API_SEND_INVITE)
                             .header("Referer", "https://my.irancell.ir/invite/confirm")
                             .json(&data).send().await;
 
                         match res2 {
                             Ok(resp2) => {
-                                if resp2.status().is_success() {
+                                // Python: if res2.status == 200 ...
+                                if resp2.status().as_u16() == 200 {
                                     let text2 = resp2.text().await.unwrap_or_default();
                                     if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
+                                        // Python: ... and response2.get("message") == "done"
                                         if body2["message"] == "done" {
                                             let mut lock = success_counter.lock().await;
                                             *lock += 1;
                                             println!("✅ Worker #{} | Proxy {} | Sent: {} ({}/{})", id, proxy_name, phone, *lock, target);
                                         } else if debug_mode { 
-                                            log_debug(format!("Worker {} Step 2 Fail: {}", id, text2)).await; 
+                                            log_debug(format!("Worker {} Step 2 Logic Fail: {}", id, text2)).await; 
                                         }
                                     }
+                                } else if debug_mode {
+                                    log_debug(format!("Worker {} Step 2 HTTP {}: {}", id, resp2.status(), phone)).await;
                                 }
                             },
                             Err(e) => { 
@@ -338,17 +298,15 @@ async fn perform_invite(
                     }
                 }
             } else {
-                // If specific HTTP errors occur, proxy might be banned
                 if debug_mode { log_debug(format!("Worker {} HTTP Error {}: {}", id, resp.status(), phone)).await; }
             }
         },
         Err(e) => { 
-            // This logs why a previously good proxy failed
+            // Network error (Proxy dead, timeout, etc)
             if debug_mode { log_debug(format!("Worker {} Net Error [{}]: {}", id, proxy_name, e)).await; } 
         }
     }
 }
-
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -356,7 +314,7 @@ async fn main() -> Result<()> {
     let config = read_config()?;
     let debug_mode = config.debug.unwrap_or(false);
     if debug_mode {
-        println!("🐞 Debug Mode ON. Errors -> '{}', Proxy Failures -> '{}'", LOG_FILE, PROXY_ERROR_FILE);
+        println!("🐞 Debug Mode ON. Errors -> '{}'", LOG_FILE);
         log_debug("--- SESSION STARTED ---".to_string()).await;
     }
 
@@ -371,8 +329,8 @@ async fn main() -> Result<()> {
 
     println!("\n✨ Select Mode:");
     println!("1) Direct Mode (No Proxy) 🌐");
-    println!("2) Auto Proxy Mode (GitHub) 🚀");
-    println!("3) Local Proxy Mode (socks5.txt) 📁");
+    println!("2) Auto Proxy Mode (GitHub - NO CHECK) 🚀");
+    println!("3) Local Proxy Mode (socks5.txt - NO CHECK) 📁");
     
     let mode_input = prompt_input("Choice [1-3]: ");
     let mode = match mode_input.as_str() {
@@ -381,47 +339,41 @@ async fn main() -> Result<()> {
         _ => RunMode::Direct,
     };
 
-    // Important: Concurrency PER WORKER
     let concurrent_input = prompt_input("⚡ Requests PER PROXY (simultaneous): ");
     let requests_per_proxy: usize = concurrent_input.parse().unwrap_or(5);
 
-    // --- PREPARE CLIENTS (Each client is tied to ONE proxy) ---
-    // Type: Vec<(String, Client)> -> (ProxyName, ClientObject)
+    // --- PREPARE WORKERS ---
     let mut workers_setup: Vec<(String, Client)> = Vec::new();
 
     if mode == RunMode::Direct {
         println!("🚀 Building Direct Client...");
-        let c = build_client(&token, None, 15)?;
-        // For Direct mode, we treat "Direct" as a single "Proxy"
+        let c = build_client(&token, None)?;
         workers_setup.push(("Direct".to_string(), c));
     } else if mode == RunMode::LocalProxy {
-        workers_setup = read_local_strict(&token)?;
+        workers_setup = read_local_no_check(&token)?;
     } else if mode == RunMode::AutoProxy {
-        workers_setup = fetch_and_validate_strict(token.clone()).await?;
+        workers_setup = fetch_proxies_no_check(token.clone()).await?;
     }
 
     if workers_setup.is_empty() {
-        return Err(anyhow!("❌ No valid workers could be initialized. Check proxy_errors.log"));
+        return Err(anyhow!("❌ No workers initialized."));
     }
 
     let active_workers = workers_setup.len();
-    println!("🚀 Launching {} workers.", active_workers);
-    println!("🔥 Total theoretical concurrency: {} req/sec", active_workers * requests_per_proxy);
+    println!("🚀 Launching {} workers immediately...", active_workers);
 
-    // --- MAIN EXECUTION ---
+    // --- MAIN LOOP ---
     let success_counter = Arc::new(Mutex::new(0));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
     
-    let mut worker_handles = Vec::new();
-
-    // Spawn 1 Worker Task per Valid Proxy
+    // Launch threads
     for (id, (p_name, client)) in workers_setup.into_iter().enumerate() {
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
         let rx = shutdown_rx.clone();
         
-        worker_handles.push(tokio::spawn(async move {
+        tokio::spawn(async move {
             run_worker_with_proxy(
                 id,
                 p_name,
@@ -433,28 +385,22 @@ async fn main() -> Result<()> {
                 rx,
                 debug_mode
             ).await;
-        }));
+        });
     }
 
-    // Monitor success count in main thread to trigger shutdown
     let monitor_success = success_counter.clone();
     let monitor_tx = shutdown_tx.clone();
     
-    // Blocking loop to check status
     loop {
         sleep(Duration::from_secs(1)).await;
         let count = *monitor_success.lock().await;
-        
         if count >= target_count {
-            let _ = monitor_tx.send(true);
+            let _ = monitor_tx.send(true); // Signal shutdown
             break;
         }
-        // Optional: Print status every few seconds
-        // println!("Status: {}/{}", count, target_count);
     }
 
-    // Wait for workers to wind down
-    println!("🏁 Target reached. Waiting for pending requests...");
+    println!("🏁 Target reached. Cooling down...");
     sleep(Duration::from_secs(2)).await;
 
     println!("\n📊 Final Results: {} Successes", *success_counter.lock().await);
