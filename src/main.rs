@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Semaphore, watch};
 use tokio::time::sleep;
 
+// --- Constants ---
 const CONFIG_FILE: &str = "config.json";
 const LOG_FILE: &str = "debug.log";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
@@ -20,6 +21,7 @@ const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.json";
 const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
 
+// --- Enums & Structs ---
 #[derive(Clone, Copy, PartialEq)]
 enum RunMode {
     Direct,
@@ -64,6 +66,8 @@ struct ProxySourceConfig {
     socks5: Vec<String>,
 }
 
+// --- Helper Functions ---
+
 fn read_config() -> Result<AppConfig> {
     if !std::path::Path::new(CONFIG_FILE).exists() {
         return Err(anyhow!("❌ '{}' not found.", CONFIG_FILE));
@@ -78,7 +82,8 @@ fn read_config() -> Result<AppConfig> {
 fn generate_random_suffix() -> String {
     let chars: Vec<char> = "1234567890".chars().collect();
     let mut rng = rand::rng(); 
-    chars.choose_multiple(&mut rng, 7).collect()
+    // Python Logic: random.sample(chars, 7) -> unique selection
+    chars.choose_multiple(&mut rng, 7).into_iter().collect()
 }
 
 fn prompt_input(prompt: &str) -> String {
@@ -92,6 +97,7 @@ fn prompt_input(prompt: &str) -> String {
 async fn log_debug(msg: String) {
     let timestamp = Local::now().format("%H:%M:%S");
     let log_line = format!("[{}] {}\n", timestamp, msg);
+    // Optimization: OpenOptions is fine here, OS buffers writes.
     let result = OpenOptions::new().create(true).append(true).open(LOG_FILE);
     if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
 }
@@ -99,9 +105,11 @@ async fn log_debug(msg: String) {
 fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     let mut clean = raw.trim().to_string();
     
+    // 1. Fix common typos
     if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
     if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
     
+    // 2. Upgrade socks5 to socks5h for remote DNS (Optimization for filtering)
     if default_proto == "socks5" || default_proto == "socks5h" {
         if clean.starts_with("socks5://") {
             return clean.replace("socks5://", "socks5h://");
@@ -111,6 +119,7 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
         }
     }
 
+    // 3. Apply Default Protocol if missing
     if !clean.contains("://") { 
         return format!("{}://{}", default_proto, clean); 
     }
@@ -118,11 +127,15 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     clean
 }
 
+// --- Client Factory ---
+
 fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
+    // Headers exactly matching Python script
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
     headers.insert("Accept-Language", "fa".parse().unwrap());
+    // reqwest handles Encoding automatically.
     headers.insert("Origin", "https://my.irancell.ir".parse().unwrap());
     headers.insert("x-app-version", "9.62.0".parse().unwrap());
     headers.insert("Authorization", reqwest::header::HeaderValue::from_str(token)?);
@@ -130,9 +143,10 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
 
     let mut builder = Client::builder()
         .default_headers(headers)
-        .tcp_nodelay(true)
-        .cookie_store(true)
+        .tcp_nodelay(true) // ⚡ Optimization: Disable Nagle's algorithm for lower latency
+        .cookie_store(true) // Match Python's Session behavior
         .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(100) // ⚡ Optimization: Allow more idle connections for reuse
         .timeout(Duration::from_secs(15));
 
     if let Some(p) = proxy {
@@ -141,6 +155,8 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
 
     builder.build().context("Failed to build client")
 }
+
+// --- Fetch Logic (With Pre-Sanitization) ---
 
 async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<String>> {
     println!("⏳ Connecting to GitHub to fetch proxy sources...");
@@ -159,6 +175,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     let mut raw_proxies = HashSet::new();
     let mut tasks = Vec::new();
 
+    // Helper to spawn download tasks
     let spawn_download = |url: String, proto: &'static str, client: Client| {
         tokio::spawn(async move {
             let mut found = Vec::new();
@@ -167,6 +184,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
                     for line in text.lines() {
                         let p = line.trim();
                         if !p.is_empty() && p.contains(':') {
+                            // ⚡ Optimization: Format URL here, once.
                             found.push(format_proxy_url(p, proto));
                         }
                     }
@@ -206,7 +224,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     for task in tasks {
         if let Ok(proxies) = task.await {
             for p in proxies {
-                raw_proxies.insert(p); 
+                raw_proxies.insert(p); // Deduplication
             }
         }
     }
@@ -238,6 +256,8 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     proxies.shuffle(&mut rand::rng());
     Ok(proxies)
 }
+
+// --- Worker Logic ---
 
 async fn run_worker_robust(
     worker_id: usize,
@@ -271,6 +291,7 @@ async fn run_worker_robust(
             }
         }
 
+        // Rotation Logic
         if consecutive_errors >= MAX_RETRIES_BEFORE_SWITCH {
             if debug_mode { 
                 log_debug(format!("♻️ Worker {} switching. Failed: {}", worker_id, current_proxy_addr)).await; 
@@ -279,9 +300,11 @@ async fn run_worker_robust(
             consecutive_errors = 0; 
         }
 
+        // Acquire New Client
         if current_client.is_none() {
             let mut pool = proxy_pool.lock().await;
             if let Some(proxy_url) = pool.pop() {
+                // proxy_url is already sanitized/formatted
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
                         current_client = Some(c);
@@ -296,6 +319,7 @@ async fn run_worker_robust(
             }
         }
 
+        // Execution
         if let Some(client) = current_client.clone() {
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
@@ -332,6 +356,7 @@ async fn perform_invite(
 
     let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
 
+    // --- STEP 1: Check App ---
     let res1 = client.post(API_CHECK_APP)
         .header("Referer", "https://my.irancell.ir/invite")
         .json(&data).send().await;
@@ -340,6 +365,7 @@ async fn perform_invite(
         Ok(resp) => {
             let status_code = resp.status();
             
+            // Hard Failures
             if status_code == 403 || status_code == 429 || status_code == 407 {
                 return ProxyStatus::HardFail; 
             }
@@ -348,6 +374,7 @@ async fn perform_invite(
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                      if body["message"] == "done" {
+                        // --- STEP 2: Send Invite ---
                         let res2 = client.post(API_SEND_INVITE)
                             .header("Referer", "https://my.irancell.ir/invite/confirm")
                             .json(&data).send().await;
@@ -462,6 +489,7 @@ async fn main() -> Result<()> {
     let workers_input = prompt_input("👷 Total Worker Threads: ");
     let worker_count: usize = workers_input.parse().unwrap_or(50);
 
+    // --- PREPARE POOL ---
     let mut raw_pool: Vec<String> = Vec::new();
 
     if mode == RunMode::LocalProxy {
