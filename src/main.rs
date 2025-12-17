@@ -10,10 +10,10 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, Semaphore, watch}; // ✅ mpsc added
+use tokio::sync::{mpsc, Mutex, Semaphore, watch}; // تمام ایمپورت‌های لازم
 use tokio::time::sleep;
 
-// --- Constants ---
+// --- Constants (بدون تغییر) ---
 const CONFIG_FILE: &str = "config.json";
 const LOG_FILE: &str = "debug.log";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
@@ -21,7 +21,7 @@ const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.txt";
 const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
 
-// --- Enums ---
+// --- Enums & Structs ---
 #[derive(Clone, Copy, PartialEq)]
 enum RunMode {
     Direct,
@@ -31,8 +31,8 @@ enum RunMode {
 
 enum ProxyStatus {
     Healthy,
-    SoftFail,
-    HardFail,
+    SoftFail, // خطای سرور (پراکسی سالم است)
+    HardFail, // خطای شبکه (پراکسی خراب است)
 }
 
 #[derive(Serialize)]
@@ -90,10 +90,11 @@ fn sanitize_proxy_url(raw: &str) -> String {
     clean
 }
 
-// --- Client Factory ---
+// --- Client Factory (دقیقاً مثل پایتون) ---
 
 fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
+    // این هدرها دقیقاً کپی هدرهای پایتون هستند
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
     headers.insert("Accept-Language", "fa".parse().unwrap());
@@ -105,7 +106,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
-        .cookie_store(true)
+        .cookie_store(true) // پایتون سشن نگه می‌دارد، ما هم نگه می‌داریم
         .pool_idle_timeout(Duration::from_secs(90))
         .timeout(Duration::from_secs(15));
 
@@ -116,9 +117,9 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     builder.build().context("Failed to build client")
 }
 
-// --- Fetch Logic ---
+// --- Fetch Logic (ساده شده و بدون تست) ---
 
-async fn fetch_proxies_list(_token: String) -> Result<Vec<String>> { // _token prefix to avoid warning
+async fn fetch_proxies_list(_token: String) -> Result<Vec<String>> {
     println!("⏳ Downloading proxy list...");
     let fetcher = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let sources_text = fetcher.get(SOURCE_OF_SOURCES_URL).send().await?.text().await?;
@@ -171,11 +172,11 @@ fn read_local_list() -> Result<Vec<String>> {
     Ok(proxies)
 }
 
-// --- Robust Worker Logic ---
+// --- Robust Worker Logic (لاجیک اصلی برنامه) ---
 
 async fn run_worker_robust(
     worker_id: usize,
-    proxy_pool: Arc<Mutex<Vec<String>>>, // removed 'mut' warning
+    proxy_pool: Arc<Mutex<Vec<String>>>,
     token: String,
     concurrency_limit: usize,
     prefixes: Arc<Vec<String>>,
@@ -184,8 +185,9 @@ async fn run_worker_robust(
     shutdown_rx: watch::Receiver<bool>,
     debug_mode: bool
 ) {
-    // ✅ FIX: Explicit channel type for mpsc
+    // کانال داخلی برای دریافت وضعیت درخواست‌ها
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
+    // سمافور برای کنترل تعداد درخواست همزمان
     let sem = Arc::new(Semaphore::new(concurrency_limit));
 
     let mut current_client: Option<Client> = None;
@@ -195,10 +197,11 @@ async fn run_worker_robust(
     loop {
         if *shutdown_rx.borrow() { break; }
 
-        // Process feedback from previous tasks
+        // بررسی وضعیت درخواست‌های قبلی
         while let Ok(status) = status_rx.try_recv() {
             match status {
                 ProxyStatus::Healthy | ProxyStatus::SoftFail => {
+                    // اگر حتی یک درخواست سالم بود، شمارنده خطا ریست شود
                     if consecutive_errors > 0 { consecutive_errors = 0; }
                 },
                 ProxyStatus::HardFail => {
@@ -207,7 +210,7 @@ async fn run_worker_robust(
             }
         }
 
-        // Decision: Switch Proxy?
+        // اگر تعداد خطاها زیاد شد، پراکسی عوض شود
         if consecutive_errors >= MAX_RETRIES_BEFORE_SWITCH {
             if debug_mode { 
                 log_debug(format!("♻️ Worker {} switching proxy! ({} errors on {})", worker_id, consecutive_errors, current_proxy_addr)).await; 
@@ -216,7 +219,7 @@ async fn run_worker_robust(
             consecutive_errors = 0; 
         }
 
-        // Get New Client if needed
+        // دریافت کلاینت جدید از استخر
         if current_client.is_none() {
             let mut pool = proxy_pool.lock().await;
             if let Some(proxy_raw) = pool.pop() {
@@ -225,29 +228,29 @@ async fn run_worker_robust(
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
                         current_client = Some(c);
                         current_proxy_addr = proxy_raw;
-                        consecutive_errors = 0; // Explicitly reset errors
+                        consecutive_errors = 0;
                     }
                 }
             } else {
-                // Pool empty
+                // استخر خالی است
                 drop(pool);
                 sleep(Duration::from_secs(2)).await;
                 continue;
             }
         }
 
-        // Launch Task
+        // ارسال درخواست جدید
         if let Some(client) = current_client.clone() {
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
                 let s_ref = success_counter.clone();
                 let p_addr = current_proxy_addr.clone();
                 let tx = status_tx.clone();
-                let s_rx = shutdown_rx.clone(); // removed 'mut' warning
+                let s_rx = shutdown_rx.clone();
                 
                 tokio::spawn(async move {
                     let _p = permit; 
-                    if *s_rx.borrow() { return; } // Check shutdown
+                    if *s_rx.borrow() { return; } 
 
                     let prefix = p_ref.choose(&mut rand::rng()).unwrap();
                     let phone = format!("98{}{}", prefix, generate_random_suffix());
@@ -274,7 +277,7 @@ async fn perform_invite(
 
     let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
 
-    // Request 1
+    // --- STEP 1: Check App ---
     let res1 = client.post(API_CHECK_APP)
         .header("Referer", "https://my.irancell.ir/invite")
         .json(&data).send().await;
@@ -283,6 +286,7 @@ async fn perform_invite(
         Ok(resp) => {
             let status_code = resp.status();
             
+            // خطاهای کشنده که نشانه خرابی پراکسی هستند
             if status_code == 403 || status_code == 429 || status_code == 407 {
                 return ProxyStatus::HardFail; 
             }
@@ -291,7 +295,7 @@ async fn perform_invite(
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                      if body["message"] == "done" {
-                        // Request 2
+                        // --- STEP 2: Send Invite ---
                         let res2 = client.post(API_SEND_INVITE)
                             .header("Referer", "https://my.irancell.ir/invite/confirm")
                             .json(&data).send().await;
@@ -302,6 +306,7 @@ async fn perform_invite(
                                     let text2 = resp2.text().await.unwrap_or_default();
                                     if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
                                         if body2["message"] == "done" {
+                                            // موفقیت کامل!
                                             let mut lock = success_counter.lock().await;
                                             *lock += 1;
                                             println!("✅ Worker #{} | Proxy {} | Sent: {} ({}/{})", id, proxy_name, phone, *lock, target);
@@ -396,17 +401,9 @@ async fn main() -> Result<()> {
         let rx = shutdown_rx.clone();
         
         if mode == RunMode::Direct {
-            // Direct mode: run special logic or just use robust worker with "Direct" pseudo-proxy
-            // Robust worker handles "Direct" logic if build_client handles None proxy.
-            // But build_client needs proxy logic. Let's make a dedicated loop for clarity or reuse.
-            // Reusing robust worker is fine if pool only has 1 item "Direct".
-            // However, "Direct" string won't parse as proxy.
-            
-            // Special case for Direct Mode to avoid proxy parsing errors
+            // Direct mode setup
             let client = build_client(&token_clone, None)?;
-            // Launch infinite task for direct mode
             tokio::spawn(async move {
-                // Direct mode doesn't switch, so we loop infinitely
                 let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
                     if *rx.borrow() { break; }
