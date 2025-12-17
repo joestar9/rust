@@ -13,16 +13,13 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Semaphore, watch};
 use tokio::time::sleep;
 
-// --- Constants ---
 const CONFIG_FILE: &str = "config.json";
 const LOG_FILE: &str = "debug.log";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
-// ✅ LINK UPDATED to new JSON source
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.json";
 const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
 
-// --- Enums & Structs ---
 #[derive(Clone, Copy, PartialEq)]
 enum RunMode {
     Direct,
@@ -67,8 +64,6 @@ struct ProxySourceConfig {
     socks5: Vec<String>,
 }
 
-// --- Helper Functions ---
-
 fn read_config() -> Result<AppConfig> {
     if !std::path::Path::new(CONFIG_FILE).exists() {
         return Err(anyhow!("❌ '{}' not found.", CONFIG_FILE));
@@ -104,11 +99,9 @@ async fn log_debug(msg: String) {
 fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     let mut clean = raw.trim().to_string();
     
-    // Fix common typos
     if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
     if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
     
-    // Upgrade socks5 to socks5h for remote DNS
     if default_proto == "socks5" || default_proto == "socks5h" {
         if clean.starts_with("socks5://") {
             return clean.replace("socks5://", "socks5h://");
@@ -124,21 +117,6 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     
     clean
 }
-
-fn sanitize_proxy_url_generic(raw: &str) -> String {
-    // Used for local file where type is unknown, assumes socks5h default or respects scheme
-    let mut clean = raw.trim().to_string();
-    if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5h://"); }
-    if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5h://"); }
-    if clean.starts_with("socks5://") { clean = clean.replace("socks5://", "socks5h://"); }
-    
-    if !clean.contains("://") { 
-        return format!("socks5h://{}", clean); 
-    }
-    clean
-}
-
-// --- Client Factory ---
 
 fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -164,8 +142,6 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     builder.build().context("Failed to build client")
 }
 
-// --- Fetch Logic (Updated with Filter) ---
-
 async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<String>> {
     println!("⏳ Connecting to GitHub to fetch proxy sources...");
     let fetcher = Client::builder().timeout(Duration::from_secs(30)).build()?;
@@ -183,7 +159,6 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     let mut raw_proxies = HashSet::new();
     let mut tasks = Vec::new();
 
-    // Helper to spawn download tasks
     let spawn_download = |url: String, proto: &'static str, client: Client| {
         tokio::spawn(async move {
             let mut found = Vec::new();
@@ -201,10 +176,9 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
         })
     };
 
-    // Apply Filter Logic
     match filter {
         ProxyFilter::All => {
-            println!("🌐 Fetching ALL proxy types (HTTP, SOCKS4, SOCKS5)...");
+            println!("🌐 Fetching ALL proxy types...");
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
             for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
@@ -224,14 +198,15 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     }
 
     if tasks.is_empty() {
-        return Err(anyhow!("No sources found for the selected proxy type in the JSON file."));
+        return Err(anyhow!("No sources found for the selected type."));
     }
 
-    println!("⬇️  Downloading from {} sources concurrently...", tasks.len());
+    println!("⬇️  Downloading from {} sources...", tasks.len());
+    
     for task in tasks {
         if let Ok(proxies) = task.await {
             for p in proxies {
-                raw_proxies.insert(p);
+                raw_proxies.insert(p); 
             }
         }
     }
@@ -241,24 +216,28 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     Ok(final_list)
 }
 
-fn read_local_list() -> Result<Vec<String>> {
-    let file = File::open("socks5.txt").context("Could not open socks5.txt")?;
+fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> {
+    let clean_path = file_path.trim().trim_matches('"').trim_matches('\'');
+    
+    let file = File::open(clean_path).context(format!("Could not open file: {}", clean_path))?;
     let reader = BufReader::new(file);
-    let mut proxies = Vec::new();
-    println!("📁 Processing local proxies...");
+    let mut unique_set = HashSet::new();
+    println!("📁 Processing local proxies from '{}' (Default: {})...", clean_path, default_proto);
+    
     for line in reader.lines() {
         if let Ok(l) = line {
             let p = l.trim().to_string();
             if !p.is_empty() { 
-                proxies.push(sanitize_proxy_url_generic(&p)); 
+                unique_set.insert(format_proxy_url(&p, default_proto)); 
             }
         }
     }
+    
+    println!("🧹 Local List: Loaded {} unique proxies.", unique_set.len());
+    let mut proxies: Vec<String> = unique_set.into_iter().collect();
     proxies.shuffle(&mut rand::rng());
     Ok(proxies)
 }
-
-// --- Robust Worker Logic ---
 
 async fn run_worker_robust(
     worker_id: usize,
@@ -303,7 +282,6 @@ async fn run_worker_robust(
         if current_client.is_none() {
             let mut pool = proxy_pool.lock().await;
             if let Some(proxy_url) = pool.pop() {
-                // proxy_url is already formatted correctly by fetch_proxies_list
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
                         current_client = Some(c);
@@ -429,16 +407,17 @@ async fn main() -> Result<()> {
     println!("\n✨ Select Mode:");
     println!("1) Direct Mode (No Proxy) 🌐");
     println!("2) Auto Proxy Mode (JSON Sources) 🚀");
-    println!("3) Local Proxy Mode (socks5.txt) 📁");
+    println!("3) Local Proxy Mode (File) 📁");
     
     let mode_input = prompt_input("Choice [1-3]: ");
     
-    // --- Logic for Proxy Selection ---
     let mut proxy_filter = ProxyFilter::All;
-    
+    let mut default_local_proto = "socks5h"; 
+    let mut local_file_path = String::from("socks5.txt"); 
+
     let mode = match mode_input.as_str() {
         "2" => {
-            println!("\n🔍 Select Proxy Protocol:");
+            println!("\n🔍 Select Proxy Protocol to Download:");
             println!("1) All (Default) 🌍");
             println!("2) HTTP/HTTPS 🌐");
             println!("3) SOCKS4 🔌");
@@ -453,7 +432,27 @@ async fn main() -> Result<()> {
             };
             RunMode::AutoProxy
         },
-        "3" => RunMode::LocalProxy,
+        "3" => {
+            let path_input = prompt_input("📁 Enter Proxy File Path (Drag & Drop): ");
+            if !path_input.trim().is_empty() {
+                local_file_path = path_input;
+            }
+
+            println!("\n🔍 Select Default Protocol for Local File:");
+            println!("1) Mixed/Auto (Respect schemes, default to SOCKS5) ⚡");
+            println!("2) HTTP/HTTPS 🌐");
+            println!("3) SOCKS4 🔌");
+            println!("4) SOCKS5 (Remote DNS) 🛡️");
+            
+            let filter_input = prompt_input("Choice [1-4]: ");
+            default_local_proto = match filter_input.as_str() {
+                "2" => "http",
+                "3" => "socks4",
+                "4" => "socks5h",
+                _ => "socks5h",
+            };
+            RunMode::LocalProxy
+        },
         _ => RunMode::Direct,
     };
 
@@ -463,14 +462,12 @@ async fn main() -> Result<()> {
     let workers_input = prompt_input("👷 Total Worker Threads: ");
     let worker_count: usize = workers_input.parse().unwrap_or(50);
 
-    // --- PREPARE POOL ---
     let mut raw_pool: Vec<String> = Vec::new();
 
     if mode == RunMode::LocalProxy {
-        raw_pool = read_local_list()?;
+        raw_pool = read_local_list(&local_file_path, default_local_proto)?;
         println!("📦 Loaded {} local proxies.", raw_pool.len());
     } else if mode == RunMode::AutoProxy {
-        // Pass the filter to fetcher
         raw_pool = fetch_proxies_list(token.clone(), proxy_filter).await?;
         println!("📦 Downloaded {} proxies.", raw_pool.len());
     } else {
