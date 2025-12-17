@@ -82,8 +82,7 @@ fn read_config() -> Result<AppConfig> {
 fn generate_random_suffix() -> String {
     let chars: Vec<char> = "1234567890".chars().collect();
     let mut rng = rand::rng(); 
-    // Python Logic: random.sample(chars, 7) -> unique selection
-    chars.choose_multiple(&mut rng, 7).into_iter().collect()
+    chars.choose_multiple(&mut rng, 7).collect()
 }
 
 fn prompt_input(prompt: &str) -> String {
@@ -97,11 +96,11 @@ fn prompt_input(prompt: &str) -> String {
 async fn log_debug(msg: String) {
     let timestamp = Local::now().format("%H:%M:%S");
     let log_line = format!("[{}] {}\n", timestamp, msg);
-    // Optimization: OpenOptions is fine here, OS buffers writes.
     let result = OpenOptions::new().create(true).append(true).open(LOG_FILE);
     if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
 }
 
+/// ✅ UPDATED: Smart Protocol Detection & Port Heuristics
 fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     let mut clean = raw.trim().to_string();
     
@@ -109,7 +108,7 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
     if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
     
-    // 2. Upgrade socks5 to socks5h for remote DNS (Optimization for filtering)
+    // 2. Optimization: Upgrade socks5 to socks5h (Remote DNS)
     if default_proto == "socks5" || default_proto == "socks5h" {
         if clean.starts_with("socks5://") {
             return clean.replace("socks5://", "socks5h://");
@@ -119,7 +118,22 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
         }
     }
 
-    // 3. Apply Default Protocol if missing
+    // 3. Heuristic for HTTP vs HTTPS based on Port
+    // If user selected HTTP mode but no scheme is present, check port.
+    if default_proto == "http" && !clean.contains("://") {
+        if let Some(port_str) = clean.split(':').last() {
+            if let Ok(port) = port_str.parse::<u16>() {
+                // Ports commonly used for HTTPS/SSL Proxies
+                if [443, 8443, 2053, 2083, 2087, 2096].contains(&port) {
+                    return format!("https://{}", clean);
+                }
+            }
+        }
+        // Fallback to standard http
+        return format!("http://{}", clean);
+    }
+
+    // 4. Default Fallback
     if !clean.contains("://") { 
         return format!("{}://{}", default_proto, clean); 
     }
@@ -131,11 +145,9 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
 
 fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
-    // Headers exactly matching Python script
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
     headers.insert("Accept-Language", "fa".parse().unwrap());
-    // reqwest handles Encoding automatically.
     headers.insert("Origin", "https://my.irancell.ir".parse().unwrap());
     headers.insert("x-app-version", "9.62.0".parse().unwrap());
     headers.insert("Authorization", reqwest::header::HeaderValue::from_str(token)?);
@@ -143,10 +155,9 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
 
     let mut builder = Client::builder()
         .default_headers(headers)
-        .tcp_nodelay(true) // ⚡ Optimization: Disable Nagle's algorithm for lower latency
-        .cookie_store(true) // Match Python's Session behavior
+        .tcp_nodelay(true)
+        .cookie_store(true)
         .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(100) // ⚡ Optimization: Allow more idle connections for reuse
         .timeout(Duration::from_secs(15));
 
     if let Some(p) = proxy {
@@ -156,7 +167,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     builder.build().context("Failed to build client")
 }
 
-// --- Fetch Logic (With Pre-Sanitization) ---
+// --- Fetch Logic ---
 
 async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<String>> {
     println!("⏳ Connecting to GitHub to fetch proxy sources...");
@@ -175,7 +186,6 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     let mut raw_proxies = HashSet::new();
     let mut tasks = Vec::new();
 
-    // Helper to spawn download tasks
     let spawn_download = |url: String, proto: &'static str, client: Client| {
         tokio::spawn(async move {
             let mut found = Vec::new();
@@ -184,7 +194,6 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
                     for line in text.lines() {
                         let p = line.trim();
                         if !p.is_empty() && p.contains(':') {
-                            // ⚡ Optimization: Format URL here, once.
                             found.push(format_proxy_url(p, proto));
                         }
                     }
@@ -202,7 +211,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
         },
         ProxyFilter::Http => {
-            println!("🌐 Fetching ONLY HTTP proxies...");
+            println!("🌐 Fetching ONLY HTTP/HTTPS proxies...");
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
         },
         ProxyFilter::Socks4 => {
@@ -224,7 +233,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     for task in tasks {
         if let Ok(proxies) = task.await {
             for p in proxies {
-                raw_proxies.insert(p); // Deduplication
+                raw_proxies.insert(p); 
             }
         }
     }
@@ -240,7 +249,7 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     let file = File::open(clean_path).context(format!("Could not open file: {}", clean_path))?;
     let reader = BufReader::new(file);
     let mut unique_set = HashSet::new();
-    println!("📁 Processing local proxies from '{}' (Default: {})...", clean_path, default_proto);
+    println!("📁 Processing local proxies from '{}'...", clean_path);
     
     for line in reader.lines() {
         if let Ok(l) = line {
@@ -257,7 +266,7 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     Ok(proxies)
 }
 
-// --- Worker Logic ---
+// --- Robust Worker Logic ---
 
 async fn run_worker_robust(
     worker_id: usize,
@@ -291,7 +300,6 @@ async fn run_worker_robust(
             }
         }
 
-        // Rotation Logic
         if consecutive_errors >= MAX_RETRIES_BEFORE_SWITCH {
             if debug_mode { 
                 log_debug(format!("♻️ Worker {} switching. Failed: {}", worker_id, current_proxy_addr)).await; 
@@ -300,11 +308,10 @@ async fn run_worker_robust(
             consecutive_errors = 0; 
         }
 
-        // Acquire New Client
         if current_client.is_none() {
             let mut pool = proxy_pool.lock().await;
             if let Some(proxy_url) = pool.pop() {
-                // proxy_url is already sanitized/formatted
+                // proxy_url is already formatted correctly
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
                         current_client = Some(c);
@@ -319,7 +326,6 @@ async fn run_worker_robust(
             }
         }
 
-        // Execution
         if let Some(client) = current_client.clone() {
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
@@ -356,7 +362,6 @@ async fn perform_invite(
 
     let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
 
-    // --- STEP 1: Check App ---
     let res1 = client.post(API_CHECK_APP)
         .header("Referer", "https://my.irancell.ir/invite")
         .json(&data).send().await;
@@ -365,7 +370,6 @@ async fn perform_invite(
         Ok(resp) => {
             let status_code = resp.status();
             
-            // Hard Failures
             if status_code == 403 || status_code == 429 || status_code == 407 {
                 return ProxyStatus::HardFail; 
             }
@@ -374,7 +378,6 @@ async fn perform_invite(
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                      if body["message"] == "done" {
-                        // --- STEP 2: Send Invite ---
                         let res2 = client.post(API_SEND_INVITE)
                             .header("Referer", "https://my.irancell.ir/invite/confirm")
                             .json(&data).send().await;
