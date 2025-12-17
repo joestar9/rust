@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{mpsc, Mutex, Semaphore, watch}; // ✅ mpsc added
 use tokio::time::sleep;
 
 // --- Constants ---
@@ -19,7 +19,7 @@ const LOG_FILE: &str = "debug.log";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.txt";
-const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; // بعد از ۳ خطا، پراکسی عوض شود
+const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
 
 // --- Enums ---
 #[derive(Clone, Copy, PartialEq)]
@@ -29,11 +29,10 @@ enum RunMode {
     LocalProxy,
 }
 
-// وضعیت سلامت پراکسی پس از درخواست
 enum ProxyStatus {
-    Healthy,      // درخواست موفق بود (یا 200 گرفتیم)
-    SoftFail,     // خطای منطقی (جیسون اشتباه)، پراکسی هنوز زنده است
-    HardFail,     // خطای شبکه، 403، 429 -> امتیاز منفی بگیرد
+    Healthy,
+    SoftFail,
+    HardFail,
 }
 
 #[derive(Serialize)]
@@ -108,7 +107,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
         .tcp_nodelay(true)
         .cookie_store(true)
         .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(15)); // 15s Request Timeout
+        .timeout(Duration::from_secs(15));
 
     if let Some(p) = proxy {
         builder = builder.proxy(p);
@@ -119,7 +118,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
 
 // --- Fetch Logic ---
 
-async fn fetch_proxies_list(token: String) -> Result<Vec<String>> {
+async fn fetch_proxies_list(_token: String) -> Result<Vec<String>> { // _token prefix to avoid warning
     println!("⏳ Downloading proxy list...");
     let fetcher = Client::builder().timeout(Duration::from_secs(30)).build()?;
     let sources_text = fetcher.get(SOURCE_OF_SOURCES_URL).send().await?.text().await?;
@@ -153,7 +152,6 @@ async fn fetch_proxies_list(token: String) -> Result<Vec<String>> {
         }
     }
     
-    // Shuffle the list for random distribution
     let mut final_list: Vec<String> = raw_proxies.into_iter().collect();
     final_list.shuffle(&mut rand::rng());
     Ok(final_list)
@@ -173,115 +171,11 @@ fn read_local_list() -> Result<Vec<String>> {
     Ok(proxies)
 }
 
-// --- Smart Worker Logic ---
-
-async fn run_smart_worker(
-    worker_id: usize,
-    mut proxy_pool: Arc<Mutex<Vec<String>>>, // Shared pool of proxy STRINGS
-    token: String,
-    concurrency_limit: usize,
-    prefixes: Arc<Vec<String>>,
-    success_counter: Arc<Mutex<usize>>,
-    target: usize,
-    shutdown_rx: watch::Receiver<bool>,
-    debug_mode: bool
-) {
-    let sem = Arc::new(Semaphore::new(concurrency_limit));
-    
-    // State of the current worker
-    let mut current_client: Option<Client> = None;
-    let mut current_proxy_addr: String = String::new();
-    let mut error_streak: u8 = 0;
-
-    loop {
-        if *shutdown_rx.borrow() { break; }
-
-        // 1. Check if we need a client (First run OR after errors)
-        if current_client.is_none() {
-            let mut pool = proxy_pool.lock().await;
-            if let Some(proxy_raw) = pool.pop() {
-                let sanitized = sanitize_proxy_url(&proxy_raw);
-                if let Ok(proxy_obj) = Proxy::all(&sanitized) {
-                    if let Ok(c) = build_client(&token, Some(proxy_obj)) {
-                        current_client = Some(c);
-                        current_proxy_addr = proxy_raw;
-                        error_streak = 0; // Reset errors on new proxy
-                        if debug_mode { log_debug(format!("Worker {} switched to: {}", worker_id, current_proxy_addr)).await; }
-                    }
-                }
-            } else {
-                // Pool empty! Wait and retry or exit
-                if debug_mode { log_debug(format!("Worker {} - Pool Empty! Sleeping...", worker_id)).await; }
-                drop(pool); // Unlock before sleep
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        }
-
-        // 2. Perform Request if we have a client
-        if let Some(client) = current_client.clone() {
-            if let Ok(permit) = sem.clone().acquire_owned().await {
-                let p_ref = prefixes.clone();
-                let s_ref = success_counter.clone();
-                let mut s_rx = shutdown_rx.clone();
-                let p_addr = current_proxy_addr.clone();
-                
-                // We need to know the result to update error_streak
-                // But tokio::spawn is detached. 
-                // Solution: We run the request inline-ish or use a channel to report back status?
-                // To keep high concurrency, we spawn, but we need a mechanism to signal "This proxy is bad".
-                // Simple approach for High Perf: If request fails, we can't easily increment error_streak inside spawn without Mutex.
-                // WE WILL USE SHARED STATE FOR THE WORKER'S HEALTH.
-                
-                let error_tracker = Arc::new(Mutex::new(0)); // Tracks errors for THIS batch
-                
-                let task = tokio::spawn(async move {
-                    let _p = permit;
-                    if *s_rx.borrow() { return ProxyStatus::Healthy; }
-
-                    let prefix = p_ref.choose(&mut rand::rng()).unwrap();
-                    let phone = format!("98{}{}", prefix, generate_random_suffix());
-
-                    perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target).await
-                });
-
-                // NOTE: In a perfect world we process the result. 
-                // But awaiting here kills concurrency.
-                // So we will optimistically continue.
-                // However, to implement "Switch on Fail", we actually DO need to await *sometimes* or check a flag.
-                // Given the requirement "Set concurrency per worker", we can actually await the JoinHandle if we want perfect control,
-                // OR we can make the worker Loop wait for one slot.
-                
-                // To implement strict error counting without blocking the whole worker, 
-                // we can assume the worker checks the status of recent tasks.
-                // For simplicity and effectiveness in this script:
-                // We will let the specific request fail. If it's a hard fail, we can't easily mutate the worker's state from the spawned task.
-                
-                // REVISED STRATEGY:
-                // The spawned task returns the status. We handle it? No, spawn returns JoinHandle.
-                // We will handle errors by just logging for now in the detached task.
-                // BUT, to satisfy "Switch Proxy", we need to change how we run.
-                // Instead of spawning blindly, we can use a `buffer_unordered` approach if we rewrote it.
-                // Keeping current structure: We will pass an `Arc<Mutex<u8>>` error_counter to the task.
-                
-                // Let's implement the error counter passing:
-                // But `current_client` is in the loop.
-                
-                // SIMPLIFIED LOGIC FOR ROBUSTNESS:
-                // If a proxy fails HARD (Network), the `perform_invite` will log it.
-                // To make the WORKER switch, we need to know.
-                // Let's make the tasks report back to a local channel!
-                
-            }
-        }
-    }
-}
-
-// --- Revised Worker Architecture for Error Feedback ---
+// --- Robust Worker Logic ---
 
 async fn run_worker_robust(
     worker_id: usize,
-    proxy_pool: Arc<Mutex<Vec<String>>>,
+    proxy_pool: Arc<Mutex<Vec<String>>>, // removed 'mut' warning
     token: String,
     concurrency_limit: usize,
     prefixes: Arc<Vec<String>>,
@@ -290,7 +184,7 @@ async fn run_worker_robust(
     shutdown_rx: watch::Receiver<bool>,
     debug_mode: bool
 ) {
-    // Channel to receive health updates from tasks
+    // ✅ FIX: Explicit channel type for mpsc
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
 
@@ -301,11 +195,10 @@ async fn run_worker_robust(
     loop {
         if *shutdown_rx.borrow() { break; }
 
-        // 1. Process feedback from previous tasks (Check if proxy is dying)
+        // Process feedback from previous tasks
         while let Ok(status) = status_rx.try_recv() {
             match status {
                 ProxyStatus::Healthy | ProxyStatus::SoftFail => {
-                    // Proxy is alive (even if logic failed). Reset streak.
                     if consecutive_errors > 0 { consecutive_errors = 0; }
                 },
                 ProxyStatus::HardFail => {
@@ -314,16 +207,16 @@ async fn run_worker_robust(
             }
         }
 
-        // 2. Decision: Switch Proxy?
+        // Decision: Switch Proxy?
         if consecutive_errors >= MAX_RETRIES_BEFORE_SWITCH {
             if debug_mode { 
                 log_debug(format!("♻️ Worker {} switching proxy! ({} errors on {})", worker_id, consecutive_errors, current_proxy_addr)).await; 
             }
-            current_client = None; // Kill client
-            consecutive_errors = 0; // Reset
+            current_client = None; 
+            consecutive_errors = 0; 
         }
 
-        // 3. Get New Client if needed
+        // Get New Client if needed
         if current_client.is_none() {
             let mut pool = proxy_pool.lock().await;
             if let Some(proxy_raw) = pool.pop() {
@@ -332,8 +225,7 @@ async fn run_worker_robust(
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
                         current_client = Some(c);
                         current_proxy_addr = proxy_raw;
-                        // Put the old proxy back? No, it was bad (or we assume pool is large enough).
-                        // If you want to recycle, push `current_proxy_addr` back to end of queue before switching.
+                        consecutive_errors = 0; // Explicitly reset errors
                     }
                 }
             } else {
@@ -344,24 +236,24 @@ async fn run_worker_robust(
             }
         }
 
-        // 4. Launch Task
+        // Launch Task
         if let Some(client) = current_client.clone() {
-            // Acquire permit
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
                 let s_ref = success_counter.clone();
                 let p_addr = current_proxy_addr.clone();
                 let tx = status_tx.clone();
+                let s_rx = shutdown_rx.clone(); // removed 'mut' warning
                 
                 tokio::spawn(async move {
-                    let _p = permit; // Hold permit
-                    
+                    let _p = permit; 
+                    if *s_rx.borrow() { return; } // Check shutdown
+
                     let prefix = p_ref.choose(&mut rand::rng()).unwrap();
                     let phone = format!("98{}{}", prefix, generate_random_suffix());
 
                     let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target).await;
                     
-                    // Send status back to worker controller
                     let _ = tx.send(status).await;
                 });
             }
@@ -391,7 +283,6 @@ async fn perform_invite(
         Ok(resp) => {
             let status_code = resp.status();
             
-            // Critical Errors: 403 (Forbidden), 429 (Too Many Requests), 407 (Proxy Auth)
             if status_code == 403 || status_code == 429 || status_code == 407 {
                 return ProxyStatus::HardFail; 
             }
@@ -418,28 +309,23 @@ async fn perform_invite(
                                         }
                                     }
                                 }
-                                // Step 2 failed but network is OK
                                 return ProxyStatus::SoftFail;
                             },
                             Err(_) => {
-                                // Network error on step 2
                                 return ProxyStatus::HardFail;
                             }
                         }
                     }
                 }
-                // Step 1 200 OK but message != done (e.g. invited before). Proxy is Healthy.
                 return ProxyStatus::Healthy;
             } else {
-                // Other HTTP errors (500, 400, etc) usually mean proxy connected but server rejected.
-                // We count as SoftFail to avoid discarding proxy too fast, unless it's blocking.
                 if debug_mode { log_debug(format!("Worker {} HTTP {} on {}", id, status_code, phone)).await; }
                 return ProxyStatus::SoftFail; 
             }
         },
         Err(e) => {
             if debug_mode { log_debug(format!("Worker {} Net Error: {}", id, e)).await; }
-            return ProxyStatus::HardFail; // Timeout, DNS error, Connection refused
+            return ProxyStatus::HardFail; 
         }
     }
 }
@@ -477,7 +363,6 @@ async fn main() -> Result<()> {
     let concurrent_input = prompt_input("⚡ Requests PER PROXY (simultaneous): ");
     let requests_per_proxy: usize = concurrent_input.parse().unwrap_or(5);
 
-    // Get Concurrent WORKER limit (threads)
     let workers_input = prompt_input("👷 Total Worker Threads: ");
     let worker_count: usize = workers_input.parse().unwrap_or(50);
 
@@ -491,13 +376,11 @@ async fn main() -> Result<()> {
         raw_pool = fetch_proxies_list(token.clone()).await?;
         println!("📦 Downloaded {} proxies.", raw_pool.len());
     } else {
-        // Direct mode: Just push "Direct" once, handled specially
         raw_pool.push("Direct".to_string());
     }
 
     if raw_pool.is_empty() { return Err(anyhow!("❌ Pool is empty.")); }
 
-    // Shared Pool of Strings
     let shared_pool = Arc::new(Mutex::new(raw_pool));
     let success_counter = Arc::new(Mutex::new(0));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -512,19 +395,37 @@ async fn main() -> Result<()> {
         let s_ref = success_counter.clone();
         let rx = shutdown_rx.clone();
         
-        // Spawn Workers
         if mode == RunMode::Direct {
-            // Direct mode setup (One client forever)
+            // Direct mode: run special logic or just use robust worker with "Direct" pseudo-proxy
+            // Robust worker handles "Direct" logic if build_client handles None proxy.
+            // But build_client needs proxy logic. Let's make a dedicated loop for clarity or reuse.
+            // Reusing robust worker is fine if pool only has 1 item "Direct".
+            // However, "Direct" string won't parse as proxy.
+            
+            // Special case for Direct Mode to avoid proxy parsing errors
             let client = build_client(&token_clone, None)?;
+            // Launch infinite task for direct mode
             tokio::spawn(async move {
-                // Direct mode doesn't need rotation, so we pass a dummy pool or custom function
-                // Re-using run_worker_robust but with a "Direct" pool is fine, it won't switch.
-                // But simpler to just run logic:
-                run_smart_worker(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode).await;
+                // Direct mode doesn't switch, so we loop infinitely
+                let sem = Arc::new(Semaphore::new(requests_per_proxy));
+                loop {
+                    if *rx.borrow() { break; }
+                    if let Ok(permit) = sem.clone().acquire_owned().await {
+                        let c = client.clone();
+                        let pr = p_ref.clone();
+                        let sr = s_ref.clone();
+                        tokio::spawn(async move {
+                            let _p = permit;
+                            let prefix = pr.choose(&mut rand::rng()).unwrap();
+                            let phone = format!("98{}{}", prefix, generate_random_suffix());
+                            perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count).await;
+                        });
+                    }
+                }
             });
         } else {
             tokio::spawn(async move {
-                run_smart_worker(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode).await;
             });
         }
     }
