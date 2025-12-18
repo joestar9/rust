@@ -444,7 +444,7 @@ async fn main() -> Result<()> {
 
     println!("\n✨ Select Mode:");
     println!("1) Direct Mode (No Proxy) 🌐");
-    println!("2) Auto Proxy Mode (Online SourcesS) 🚀");
+    println!("2) Auto Proxy Mode (Online Sources) 🚀");
     println!("3) Local Proxy Mode (File) 📁");
     
     let mode_input = prompt_input("Choice [1-3]: ");
