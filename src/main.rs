@@ -100,12 +100,15 @@ async fn log_debug(msg: String) {
     if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
 }
 
+/// ✅ UPDATED: Smart Protocol Detection & Port Heuristics
 fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     let mut clean = raw.trim().to_string();
     
+    // 1. Fix common typos
     if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
     if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
     
+    // 2. Optimization: Upgrade socks5 to socks5h (Remote DNS)
     if default_proto == "socks5" || default_proto == "socks5h" {
         if clean.starts_with("socks5://") {
             return clean.replace("socks5://", "socks5h://");
@@ -115,6 +118,22 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
         }
     }
 
+    // 3. Heuristic for HTTP vs HTTPS based on Port
+    // If user selected HTTP mode but no scheme is present, check port.
+    if default_proto == "http" && !clean.contains("://") {
+        if let Some(port_str) = clean.split(':').last() {
+            if let Ok(port) = port_str.parse::<u16>() {
+                // Ports commonly used for HTTPS/SSL Proxies
+                if [443, 8443, 2053, 2083, 2087, 2096].contains(&port) {
+                    return format!("https://{}", clean);
+                }
+            }
+        }
+        // Fallback to standard http
+        return format!("http://{}", clean);
+    }
+
+    // 4. Default Fallback
     if !clean.contains("://") { 
         return format!("{}://{}", default_proto, clean); 
     }
@@ -192,7 +211,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
         },
         ProxyFilter::Http => {
-            println!("🌐 Fetching ONLY HTTP proxies...");
+            println!("🌐 Fetching ONLY HTTP/HTTPS proxies...");
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
         },
         ProxyFilter::Socks4 => {
@@ -230,7 +249,7 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     let file = File::open(clean_path).context(format!("Could not open file: {}", clean_path))?;
     let reader = BufReader::new(file);
     let mut unique_set = HashSet::new();
-    println!("📁 Processing local proxies from '{}' (Default: {})...", clean_path, default_proto);
+    println!("📁 Processing local proxies from '{}'...", clean_path);
     
     for line in reader.lines() {
         if let Ok(l) = line {
@@ -247,7 +266,7 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     Ok(proxies)
 }
 
-// --- Worker Logic ---
+// --- Robust Worker Logic ---
 
 async fn run_worker_robust(
     worker_id: usize,
@@ -258,8 +277,7 @@ async fn run_worker_robust(
     success_counter: Arc<Mutex<usize>>,
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
-    debug_mode: bool,
-    use_send_invite: bool
+    debug_mode: bool
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -293,6 +311,7 @@ async fn run_worker_robust(
         if current_client.is_none() {
             let mut pool = proxy_pool.lock().await;
             if let Some(proxy_url) = pool.pop() {
+                // proxy_url is already formatted correctly
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
                         current_client = Some(c);
@@ -314,7 +333,6 @@ async fn run_worker_robust(
                 let p_addr = current_proxy_addr.clone();
                 let tx = status_tx.clone();
                 let s_rx = shutdown_rx.clone();
-                let sd_tx = shutdown_tx.clone();
                 
                 tokio::spawn(async move {
                     let _p = permit; 
@@ -323,7 +341,7 @@ async fn run_worker_robust(
                     let prefix = p_ref.choose(&mut rand::rng()).unwrap();
                     let phone = format!("98{}{}", prefix, generate_random_suffix());
 
-                    let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target, use_send_invite, &sd_tx).await;
+                    let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target).await;
                     let _ = tx.send(status).await;
                 });
             }
@@ -338,9 +356,7 @@ async fn perform_invite(
     phone: String,
     success_counter: &Arc<Mutex<usize>>,
     debug_mode: bool,
-    target: usize,
-    use_send_invite: bool,
-    shutdown_tx: &watch::Sender<bool>
+    target: usize
 ) -> ProxyStatus {
     if *success_counter.lock().await >= target { return ProxyStatus::Healthy; }
 
@@ -362,50 +378,32 @@ async fn perform_invite(
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                      if body["message"] == "done" {
-                        
-                        if use_send_invite {
-                            let res2 = client.post(API_SEND_INVITE)
-                                .header("Referer", "https://my.irancell.ir/invite/confirm")
-                                .json(&data).send().await;
+                        let res2 = client.post(API_SEND_INVITE)
+                            .header("Referer", "https://my.irancell.ir/invite/confirm")
+                            .json(&data).send().await;
 
-                            match res2 {
-                                Ok(resp2) => {
-                                    if resp2.status().as_u16() == 200 {
-                                        let text2 = resp2.text().await.unwrap_or_default();
-                                        if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
-                                            if body2["message"] == "done" {
-                                                // Success with Step 2
-                                            }
+                        match res2 {
+                            Ok(resp2) => {
+                                if resp2.status().as_u16() == 200 {
+                                    let text2 = resp2.text().await.unwrap_or_default();
+                                    if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
+                                        if body2["message"] == "done" {
+                                            let mut lock = success_counter.lock().await;
+                                            *lock += 1;
+                                            println!("✅ Worker #{} | Proxy {} | Sent: {} ({}/{})", id, proxy_name, phone, *lock, target);
+                                            return ProxyStatus::Healthy;
                                         }
-                                    } else {
-                                        return ProxyStatus::SoftFail;
                                     }
-                                },
-                                Err(_) => {
-                                    return ProxyStatus::HardFail;
                                 }
+                                return ProxyStatus::SoftFail;
+                            },
+                            Err(_) => {
+                                return ProxyStatus::HardFail;
                             }
                         }
-                        
-                        // Common success logic for both cases
-                        let mut lock = success_counter.lock().await;
-                        *lock += 1;
-                        let current = *lock;
-                        if use_send_invite {
-                            println!("✅ Worker #{} | Proxy {} | Sent: {} ({}/{})", id, proxy_name, phone, current, target);
-                        } else {
-                            println!("✅ Worker #{} | Proxy {} | Checked: {} ({}/{})", id, proxy_name, phone, current, target);
-                        }
-
-                        if current >= target {
-                            println!("🎉 Target reached! Stopping...");
-                            let _ = shutdown_tx.send(true);
-                        }
-
-                        return ProxyStatus::Healthy;
-                     }
+                    }
                 }
-                return ProxyStatus::Healthy; // Message was not "done", but connection is fine
+                return ProxyStatus::Healthy;
             } else {
                 if debug_mode { log_debug(format!("Worker {} HTTP {} on {}", id, status_code, phone)).await; }
                 return ProxyStatus::SoftFail; 
@@ -493,10 +491,6 @@ async fn main() -> Result<()> {
 
     let workers_input = prompt_input("👷 Total Worker Threads: ");
     let worker_count: usize = workers_input.parse().unwrap_or(50);
-    
-    // ✅ NEW: Ask user about step 2
-    let send_invite_input = prompt_input("\n❓ Send Invite Notification (Step 2)? [Y/n]: ");
-    let use_send_invite = !send_invite_input.to_lowercase().starts_with('n'); // Default to yes
 
     // --- PREPARE POOL ---
     let mut raw_pool: Vec<String> = Vec::new();
@@ -537,19 +531,18 @@ async fn main() -> Result<()> {
                         let c = client.clone();
                         let pr = p_ref.clone();
                         let sr = s_ref.clone();
-                        let sd_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
                             let _p = permit;
                             let prefix = pr.choose(&mut rand::rng()).unwrap();
                             let phone = format!("98{}{}", prefix, generate_random_suffix());
-                            perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count, use_send_invite, &sd_tx).await;
+                            perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count).await;
                         });
                     }
                 }
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode).await;
             });
         }
     }
