@@ -23,7 +23,7 @@ mod core {
 }
 
 mod models {
-    use super::serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Copy, PartialEq)]
     pub enum RunMode {
@@ -48,7 +48,7 @@ mod models {
         HardFail,
     }
 
-    #[derive(super::serde::Serialize)]
+    #[derive(Serialize)]
     pub struct InviteData {
         pub application_name: String,
         pub friend_number: String,
@@ -281,6 +281,7 @@ mod network {
 
 mod worker {
     use super::*;
+    use tokio::sync::mpsc;
 
     pub async fn run_worker_robust(
         worker_id: usize,
@@ -346,14 +347,14 @@ mod worker {
                     let s_ref = success_counter.clone();
                     let p_addr = current_proxy_addr.clone();
                     let tx = status_tx.clone();
-                    let mut s_rx = shutdown_rx.clone();
+                    let s_rx = shutdown_rx.clone();
                     let sd_tx = shutdown_rx.sender().clone();
                     
                     tokio::spawn(async move {
                         let _p = permit; 
                         if *s_rx.borrow() { return; } 
 
-                        let prefix = p_ref.choose(&mut rand::rng()).unwrap();
+                        let prefix = p_ref.as_slice().choose(&mut rand::rng()).unwrap();
                         let phone = format!("98{}{}", prefix, utils::generate_random_suffix());
 
                         let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target, use_send_invite, &sd_tx).await;
@@ -403,9 +404,7 @@ mod worker {
 
                                 match res2 {
                                     Ok(resp2) => {
-                                        if resp2.status().as_u16() != 200 {
-                                            return models::ProxyStatus::SoftFail;
-                                        }
+                                        if resp2.status().as_u16() != 200 { return models::ProxyStatus::SoftFail; }
                                     },
                                     Err(_) => { return models::ProxyStatus::HardFail; }
                                 }
@@ -417,9 +416,7 @@ mod worker {
                             let action = if use_send_invite { "Sent" } else { "Checked" };
                             println!("✅ Worker #{} | Proxy {} | {}: {} ({}/{})", id, proxy_name, action, phone, current, target);
 
-                            if current >= target {
-                                let _ = shutdown_tx.send(true);
-                            }
+                            if current >= target { let _ = shutdown_tx.send(true); }
 
                             return models::ProxyStatus::Healthy;
                          }
@@ -491,9 +488,7 @@ async fn main() -> Result<()> {
         },
         "3" => {
             let path_input = utils::prompt_input("📁 Enter Proxy File Path (Drag & Drop): ");
-            if !path_input.trim().is_empty() {
-                local_file_path = path_input;
-            }
+            if !path_input.trim().is_empty() { local_file_path = path_input; }
 
             println!("\n🔍 Select Default Protocol for Local File:");
             println!("1) Smart Guess (Based on Port) 🤔");
@@ -564,7 +559,7 @@ async fn main() -> Result<()> {
                         let sd_tx = shutdown_tx.clone();
                         tokio::spawn(async move {
                             let _p = permit;
-                            let prefix = pr.choose(&mut rand::rng()).unwrap();
+                            let prefix = pr.as_slice().choose(&mut rand::rng()).unwrap();
                             let phone = format!("98{}{}", prefix, utils::generate_random_suffix());
                             worker::perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count, use_send_invite, &sd_tx).await;
                         });
