@@ -495,16 +495,16 @@ async fn main() -> Result<()> {
     let api_input = prompt_input("Choice [1-2]: ");
     let use_send_invite = match api_input.as_str() {
         "2" => {
-            println!("✅ Only checking app (no invites SMS will be sent)");
+            println!("✅ Only checking app (NO SMS invites will be sent)");
             false
         },
         _ => {
-            println!("⚠️ Using Send Invite SMS Method");
+            println!("⚠️ Using Send SMS Invite Method");
             true
         }
     };
 
-    let concurrent_input = prompt_input("⚡ Requests PER PROXY: ");
+    let concurrent_input = prompt_input("⚡ Requests PER Worker: ");
     let requests_per_proxy: usize = concurrent_input.parse().unwrap_or(5);
 
     let workers_input = prompt_input("👷 Total Worker Threads: ");
