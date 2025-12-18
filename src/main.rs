@@ -93,6 +93,18 @@ fn prompt_input(prompt: &str) -> String {
     buffer.trim().to_string()
 }
 
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
+    let input = prompt_input(prompt);
+    let s = input.trim().to_lowercase();
+    if s.is_empty() { return default_yes; }
+    match s.as_str() {
+        "y" | "yes" | "1" | "true" | "t" => true,
+        "n" | "no" | "0" | "false" | "f" => false,
+        _ => default_yes,
+    }
+}
+
+
 async fn log_debug(msg: String) {
     let timestamp = Local::now().format("%H:%M:%S");
     let log_line = format!("[{}] {}\n", timestamp, msg);
@@ -277,7 +289,8 @@ async fn run_worker_robust(
     success_counter: Arc<Mutex<usize>>,
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
-    debug_mode: bool
+    debug_mode: bool,
+    use_send_invite: bool
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -333,6 +346,7 @@ async fn run_worker_robust(
                 let p_addr = current_proxy_addr.clone();
                 let tx = status_tx.clone();
                 let s_rx = shutdown_rx.clone();
+                let use_send = use_send_invite;
                 
                 tokio::spawn(async move {
                     let _p = permit; 
@@ -341,7 +355,7 @@ async fn run_worker_robust(
                     let prefix = p_ref.choose(&mut rand::rng()).unwrap();
                     let phone = format!("98{}{}", prefix, generate_random_suffix());
 
-                    let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target).await;
+                    let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target, use_send).await;
                     let _ = tx.send(status).await;
                 });
             }
@@ -356,7 +370,8 @@ async fn perform_invite(
     phone: String,
     success_counter: &Arc<Mutex<usize>>,
     debug_mode: bool,
-    target: usize
+    target: usize,
+    use_send_invite: bool
 ) -> ProxyStatus {
     if *success_counter.lock().await >= target { return ProxyStatus::Healthy; }
 
@@ -378,6 +393,13 @@ async fn perform_invite(
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                      if body["message"] == "done" {
+                        if !use_send_invite {
+                            let mut lock = success_counter.lock().await;
+                            *lock += 1;
+                            println!("✅ Worker #{} | Proxy {} | Sent: {} ({}/{})", id, proxy_name, phone, *lock, target);
+                            return ProxyStatus::Healthy;
+                        }
+
                         let res2 = client.post(API_SEND_INVITE)
                             .header("Referer", "https://my.irancell.ir/invite/confirm")
                             .json(&data).send().await;
@@ -433,6 +455,8 @@ async fn main() -> Result<()> {
     println!("📱 Loaded {} prefixes.", config.prefixes.len());
     let count_input = prompt_input("🎯 Target SUCCESS Count: ");
     let target_count: usize = count_input.parse().unwrap_or(1000);
+
+    let use_send_invite = prompt_yes_no("📩 Use api_send_invite (notify) after api_phone_has_app? [y/N]: ", false);
 
     println!("\n✨ Select Mode:");
     println!("1) Direct Mode (No Proxy) 🌐");
@@ -520,6 +544,7 @@ async fn main() -> Result<()> {
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
         let rx = shutdown_rx.clone();
+        let use_send_invite_flag = use_send_invite;
         
         if mode == RunMode::Direct {
             let client = build_client(&token_clone, None)?;
@@ -535,14 +560,14 @@ async fn main() -> Result<()> {
                             let _p = permit;
                             let prefix = pr.choose(&mut rand::rng()).unwrap();
                             let phone = format!("98{}{}", prefix, generate_random_suffix());
-                            perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count).await;
+                            perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count, use_send_invite_flag).await;
                         });
                     }
                 }
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite_flag).await;
             });
         }
     }
