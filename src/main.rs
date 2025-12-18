@@ -33,6 +33,7 @@ enum RunMode {
 enum ProxyFilter {
     All,
     Http,
+    Https,
     Socks4,
     Socks5,
 }
@@ -60,6 +61,8 @@ struct AppConfig {
 struct ProxySourceConfig {
     #[serde(default)]
     http: Vec<String>,
+    #[serde(default)]
+    https: Vec<String>,
     #[serde(default)]
     socks4: Vec<String>,
     #[serde(default)]
@@ -92,18 +95,6 @@ fn prompt_input(prompt: &str) -> String {
     io::stdin().read_line(&mut buffer).unwrap();
     buffer.trim().to_string()
 }
-
-fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
-    let input = prompt_input(prompt);
-    let s = input.trim().to_lowercase();
-    if s.is_empty() { return default_yes; }
-    match s.as_str() {
-        "y" | "yes" | "1" | "true" | "t" => true,
-        "n" | "no" | "0" | "false" | "f" => false,
-        _ => default_yes,
-    }
-}
-
 
 async fn log_debug(msg: String) {
     let timestamp = Local::now().format("%H:%M:%S");
@@ -219,12 +210,17 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
         ProxyFilter::All => {
             println!("🌐 Fetching ALL proxy types...");
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
+            for url in sources.https { tasks.push(spawn_download(url, "https", fetcher.clone())); }
             for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
         },
         ProxyFilter::Http => {
-            println!("🌐 Fetching ONLY HTTP/HTTPS proxies...");
+            println!("🌐 Fetching ONLY HTTP proxies...");
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
+        },
+        ProxyFilter::Https => {
+            println!("🌐 Fetching ONLY HTTPS proxies...");
+            for url in sources.https { tasks.push(spawn_download(url, "https", fetcher.clone())); }
         },
         ProxyFilter::Socks4 => {
             println!("🌐 Fetching ONLY SOCKS4 proxies...");
@@ -346,7 +342,6 @@ async fn run_worker_robust(
                 let p_addr = current_proxy_addr.clone();
                 let tx = status_tx.clone();
                 let s_rx = shutdown_rx.clone();
-                let use_send = use_send_invite;
                 
                 tokio::spawn(async move {
                     let _p = permit; 
@@ -355,7 +350,7 @@ async fn run_worker_robust(
                     let prefix = p_ref.choose(&mut rand::rng()).unwrap();
                     let phone = format!("98{}{}", prefix, generate_random_suffix());
 
-                    let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target, use_send).await;
+                    let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target, use_send_invite).await;
                     let _ = tx.send(status).await;
                 });
             }
@@ -392,14 +387,16 @@ async fn perform_invite(
             if status_code.as_u16() == 200 {
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
-                     if body["message"] == "done" {
+                    if body["message"] == "done" {
+                        // اگر کاربر فقط چک کردن اپلیکیشن را انتخاب کرده باشد
                         if !use_send_invite {
                             let mut lock = success_counter.lock().await;
                             *lock += 1;
-                            println!("✅ Worker #{} | Proxy {} | Sent: {} ({}/{})", id, proxy_name, phone, *lock, target);
+                            println!("✅ Worker #{} | Proxy {} | App Checked: {} ({}/{})", id, proxy_name, phone, *lock, target);
                             return ProxyStatus::Healthy;
                         }
-
+                        
+                        // اگر کاربر ارسال دعوت را انتخاب کرده باشد
                         let res2 = client.post(API_SEND_INVITE)
                             .header("Referer", "https://my.irancell.ir/invite/confirm")
                             .json(&data).send().await;
@@ -456,8 +453,6 @@ async fn main() -> Result<()> {
     let count_input = prompt_input("🎯 Target SUCCESS Count: ");
     let target_count: usize = count_input.parse().unwrap_or(1000);
 
-    let use_send_invite = prompt_yes_no("📩 Use api_send_invite (notify) after api_phone_has_app? [y/N]: ", false);
-
     println!("\n✨ Select Mode:");
     println!("1) Direct Mode (No Proxy) 🌐");
     println!("2) Auto Proxy Mode (JSON Sources) 🚀");
@@ -473,15 +468,17 @@ async fn main() -> Result<()> {
         "2" => {
             println!("\n🔍 Select Proxy Protocol to Download:");
             println!("1) All (Default) 🌍");
-            println!("2) HTTP/HTTPS 🌐");
-            println!("3) SOCKS4 🔌");
-            println!("4) SOCKS5 (Remote DNS) 🛡️");
+            println!("2) HTTP 🌐");
+            println!("3) HTTPS 🔒");
+            println!("4) SOCKS4 🔌");
+            println!("5) SOCKS5 (Remote DNS) 🛡️");
             
-            let filter_input = prompt_input("Choice [1-4]: ");
+            let filter_input = prompt_input("Choice [1-5]: ");
             proxy_filter = match filter_input.as_str() {
                 "2" => ProxyFilter::Http,
-                "3" => ProxyFilter::Socks4,
-                "4" => ProxyFilter::Socks5,
+                "3" => ProxyFilter::Https,
+                "4" => ProxyFilter::Socks4,
+                "5" => ProxyFilter::Socks5,
                 _ => ProxyFilter::All,
             };
             RunMode::AutoProxy
@@ -494,20 +491,39 @@ async fn main() -> Result<()> {
 
             println!("\n🔍 Select Default Protocol for Local File:");
             println!("1) Mixed/Auto (Respect schemes, default to SOCKS5) ⚡");
-            println!("2) HTTP/HTTPS 🌐");
-            println!("3) SOCKS4 🔌");
-            println!("4) SOCKS5 (Remote DNS) 🛡️");
+            println!("2) HTTP 🌐");
+            println!("3) HTTPS 🔒");
+            println!("4) SOCKS4 🔌");
+            println!("5) SOCKS5 (Remote DNS) 🛡️");
             
-            let filter_input = prompt_input("Choice [1-4]: ");
+            let filter_input = prompt_input("Choice [1-5]: ");
             default_local_proto = match filter_input.as_str() {
                 "2" => "http",
-                "3" => "socks4",
-                "4" => "socks5h",
+                "3" => "https",
+                "4" => "socks4",
+                "5" => "socks5h",
                 _ => "socks5h",
             };
             RunMode::LocalProxy
         },
         _ => RunMode::Direct,
+    };
+
+    // سوال جدید: استفاده از API ارسال دعوت یا فقط چک کردن اپلیکیشن
+    println!("\n🔧 Select API Usage:");
+    println!("1) Use Both APIs (Check App + Send Invite) - Default");
+    println!("2) Only Check App (API_CHECK_APP only)");
+    
+    let api_input = prompt_input("Choice [1-2]: ");
+    let use_send_invite = match api_input.as_str() {
+        "2" => {
+            println!("⚠️  Only checking app (no invites will be sent)");
+            false
+        },
+        _ => {
+            println!("✅ Using both APIs (check app + send invite)");
+            true
+        }
     };
 
     let concurrent_input = prompt_input("⚡ Requests PER PROXY (simultaneous): ");
@@ -544,7 +560,6 @@ async fn main() -> Result<()> {
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
         let rx = shutdown_rx.clone();
-        let use_send_invite_flag = use_send_invite;
         
         if mode == RunMode::Direct {
             let client = build_client(&token_clone, None)?;
@@ -560,14 +575,14 @@ async fn main() -> Result<()> {
                             let _p = permit;
                             let prefix = pr.choose(&mut rand::rng()).unwrap();
                             let phone = format!("98{}{}", prefix, generate_random_suffix());
-                            perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count, use_send_invite_flag).await;
+                            perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count, use_send_invite).await;
                         });
                     }
                 }
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite_flag).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite).await;
             });
         }
     }
