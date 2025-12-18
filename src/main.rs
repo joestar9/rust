@@ -1,11 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::Local;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::prelude::*;
-use reqwest_impersonate::impersonate::Impersonate;
-use reqwest_impersonate::{Client, Proxy};
+use rquest::{Client, Proxy, Impersonate}; // استفاده از rquest
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -38,7 +35,6 @@ enum ProxyFilter {
     All,
     Http,
     Https,
-    Socks4,
     Socks5,
 }
 
@@ -47,7 +43,7 @@ enum ProxyStatus {
     Healthy,
     SoftFail,
     HardFail,
-    GlobalCoolDown, // New: Signal to slow down globally
+    GlobalCoolDown,
 }
 
 #[derive(Serialize)]
@@ -187,7 +183,8 @@ impl ProxyManager {
     }
 
     async fn fetch_online_proxies(&self) -> Result<Vec<String>> {
-        let client = Client::builder().impersonate(Impersonate::Chrome126).build()?;
+        // برای دانلود لیست پراکسی از کلاینت معمولی استفاده می‌کنیم
+        let client = Client::builder().build()?; 
         let json_text = client.get(SOURCE_OF_SOURCES_URL).send().await?.text().await?;
         let sources: ProxySourceConfig = serde_json::from_str(&json_text)?;
 
@@ -211,7 +208,6 @@ impl ProxyManager {
             })
         };
 
-        // Simplified logic for brevity, expands based on filter
         match self.filter {
             ProxyFilter::All => {
                 for url in sources.http { tasks.push(spawn_dl(url, "http", client.clone())); }
@@ -254,20 +250,18 @@ impl ProxyManager {
 
 // --- WORKER ---
 
-// 1. IMPROVEMENT: Use reqwest_impersonate for TLS Fingerprint
 async fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
-    let mut headers = reqwest_impersonate::header::HeaderMap::new();
-    headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
+    // rquest به طور خودکار هدرهای کروم را تنظیم میکند
+    // اما هدرهای اختصاصی ایرانسل را باید دستی اضافه کنیم
+    let mut headers = rquest::header::HeaderMap::new();
     headers.insert("Accept-Language", "fa-IR,fa;q=0.9,en-US;q=0.8,en;q=0.7".parse().unwrap());
     headers.insert("Origin", "https://my.irancell.ir".parse().unwrap());
     headers.insert("x-app-version", "9.62.0".parse().unwrap());
-    headers.insert("Authorization", reqwest_impersonate::header::HeaderValue::from_str(token)?);
+    headers.insert("Authorization", rquest::header::HeaderValue::from_str(token)?);
     headers.insert("Content-Type", "application/json".parse().unwrap());
 
     let mut builder = Client::builder()
-        .impersonate(Impersonate::Chrome126) // Mimic Real Chrome Browser
-        .enable_ech_grease()
-        .permute_extensions()
+        .impersonate(Impersonate::Chrome126) // شبیه سازی کروم ۱۲۶
         .default_headers(headers)
         .cookie_store(true)
         .timeout(Duration::from_secs(15));
@@ -284,10 +278,10 @@ async fn run_worker(
     manager: Arc<ProxyManager>,
     token: String,
     prefixes: Arc<Vec<String>>,
-    counters: Arc<(AtomicUsize, AtomicUsize, AtomicUsize)>, // Success, Fail, Consecutive429
+    counters: Arc<(AtomicUsize, AtomicUsize, AtomicUsize)>,
     target: usize,
     mut shutdown: watch::Receiver<bool>,
-    pb: ProgressBar, // 5. IMPROVEMENT: TUI Progress Bar
+    pb: ProgressBar, 
     send_invite: bool,
     req_per_proxy: usize
 ) {
@@ -299,10 +293,10 @@ async fn run_worker(
     loop {
         if *shutdown.borrow() { break; }
 
-        // 7. IMPROVEMENT: Global Backoff for 429
+        // Global Backoff
         if counters.2.load(Ordering::Relaxed) > 20 {
-            sleep(Duration::from_secs(5)).await; // Wait if too many 429s globally
-            if id == 0 { counters.2.store(0, Ordering::Relaxed); } // Reset by one worker
+            sleep(Duration::from_secs(5)).await;
+            if id == 0 { counters.2.store(0, Ordering::Relaxed); }
         }
 
         if client.is_none() || fails >= MAX_RETRIES_BEFORE_SWITCH || reqs >= req_per_proxy {
@@ -341,7 +335,7 @@ async fn run_worker(
                  ProxyStatus::Healthy => { fails = 0; },
                  ProxyStatus::SoftFail => { 
                      fails += 1; 
-                     counters.1.fetch_add(1, Ordering::Relaxed); // Inc fail counter
+                     counters.1.fetch_add(1, Ordering::Relaxed);
                  },
                  ProxyStatus::HardFail => { 
                      fails = MAX_RETRIES_BEFORE_SWITCH + 1; 
@@ -349,7 +343,7 @@ async fn run_worker(
                  },
                  ProxyStatus::GlobalCoolDown => {
                      fails = MAX_RETRIES_BEFORE_SWITCH + 1;
-                     counters.2.fetch_add(1, Ordering::Relaxed); // Trigger global warning
+                     counters.2.fetch_add(1, Ordering::Relaxed);
                  }
              }
         }
@@ -370,9 +364,8 @@ async fn perform_invite(
         Ok(resp) => {
             let status = resp.status();
             
-            // 7. IMPROVEMENT: Smart status handling
-            if status == 429 { return ProxyStatus::GlobalCoolDown; } // Too many requests
-            if status == 403 || status == 407 { return ProxyStatus::HardFail; } // Proxy banned
+            if status == 429 { return ProxyStatus::GlobalCoolDown; }
+            if status == 403 || status == 407 { return ProxyStatus::HardFail; }
             
             if status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
@@ -382,7 +375,7 @@ async fn perform_invite(
                             Ok(resp2) => {
                                 if resp2.status().is_success() && resp2.text().await.unwrap_or_default().contains("done") {
                                     counters.0.fetch_add(1, Ordering::SeqCst);
-                                    pb.inc(1); // Update TUI
+                                    pb.inc(1);
                                     return ProxyStatus::Healthy;
                                 }
                                 return ProxyStatus::SoftFail;
@@ -453,14 +446,12 @@ async fn main() -> Result<()> {
 
     let manager = Arc::new(ProxyManager::new(run_mode, token.clone(), proxy_filter, local_path, "socks5h".to_string()));
     
-    // Initial Refill
     manager.trigger_refill_if_needed().await;
     if run_mode != RunMode::Direct { 
         println!("⏳ Fetching proxies..."); 
         sleep(Duration::from_secs(3)).await; 
     }
 
-    // 5. IMPROVEMENT: TUI Setup
     let multi_pb = MultiProgress::new();
     let sty = ProgressStyle::with_template(
         "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) \n{msg}",
@@ -469,7 +460,6 @@ async fn main() -> Result<()> {
     let pb = multi_pb.add(ProgressBar::new(target_count as u64));
     pb.set_style(sty);
 
-    // Shared Counters: (Success, Fail, Consecutive429)
     let counters = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
@@ -488,7 +478,6 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // Monitoring Loop for TUI Stats
     let monitor_cnt = counters.clone();
     let monitor_pb = pb.clone();
     tokio::spawn(async move {
