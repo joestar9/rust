@@ -21,16 +21,32 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: irancell_pro_invite_linux_x64
             executable_name: irancell_pro_invite
-          
+
           # ✅ Windows 64-bit (x86_64)
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: irancell_pro_invite_windows_x64.exe
             executable_name: irancell_pro_invite.exe
 
+          # ✅ Android / Termux (ARM64)
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            android_abi: arm64-v8a
+            artifact_name: irancell_pro_invite_android_arm64
+            executable_name: irancell_pro_invite
+
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
+
+    # فقط برای اندروید: NDK را نصب کن
+    - name: Setup Android NDK
+      if: ${{ matrix.android_abi != '' }}
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r26d
+        add-to-path: false
 
     - name: Install Rust Toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -40,14 +56,24 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Build Release
+    - name: Build Release (Desktop)
+      if: ${{ matrix.android_abi == '' }}
       run: cargo build --release --target ${{ matrix.target }}
+
+    - name: Build Release (Android)
+      if: ${{ matrix.android_abi != '' }}
+      shell: bash
+      env:
+        ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        CARGO_NDK_PLATFORM: 21
+      run: |
+        cargo install cargo-ndk --locked
+        cargo ndk -t ${{ matrix.android_abi }} build --release
 
     - name: Prepare Artifacts
       shell: bash
       run: |
         mkdir release_pack
-        
         cp target/${{ matrix.target }}/release/${{ matrix.executable_name }} release_pack/${{ matrix.artifact_name }}
 
         if [ -f config.json ]; then
