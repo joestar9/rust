@@ -547,7 +547,7 @@ async fn main() -> Result<()> {
         
         if mode == models::RunMode::Direct {
             let client = network::build_client(&token_clone, None)?;
-            let sd_tx_clone = shutdown_tx.clone();
+            let sd_tx_clone = shutdown_tx.clone(); // ✅ FIX: Clone sender before loop
             tokio::spawn(async move {
                 let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
@@ -556,7 +556,7 @@ async fn main() -> Result<()> {
                         let c = client.clone();
                         let pr = p_ref.clone();
                         let sr = s_ref.clone();
-                        let sd_tx_inner = sd_tx_clone.clone();
+                        let sd_tx_inner = sd_tx_clone.clone(); // ✅ FIX: Clone for each task
                         tokio::spawn(async move {
                             let _p = permit;
                             let prefix = pr.as_slice().choose(&mut rand::rng()).unwrap();
