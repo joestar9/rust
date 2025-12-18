@@ -455,7 +455,7 @@ async fn main() -> Result<()> {
 
     println!("\n✨ Select Mode:");
     println!("1) Direct Mode (No Proxy) 🌐");
-    println!("2) Auto Proxy Mode (JSON Sources) 🚀");
+    println!("2) Auto Proxy Mode (Online SourcesS 🚀");
     println!("3) Local Proxy Mode (File) 📁");
     
     let mode_input = prompt_input("Choice [1-3]: ");
@@ -471,7 +471,7 @@ async fn main() -> Result<()> {
             println!("2) HTTP 🌐");
             println!("3) HTTPS 🔒");
             println!("4) SOCKS4 🔌");
-            println!("5) SOCKS5 (Remote DNS) 🛡️");
+            println!("5) SOCKS5 🛡️");
             
             let filter_input = prompt_input("Choice [1-5]: ");
             proxy_filter = match filter_input.as_str() {
@@ -494,7 +494,7 @@ async fn main() -> Result<()> {
             println!("2) HTTP 🌐");
             println!("3) HTTPS 🔒");
             println!("4) SOCKS4 🔌");
-            println!("5) SOCKS5 (Remote DNS) 🛡️");
+            println!("5) SOCKS5 🛡️");
             
             let filter_input = prompt_input("Choice [1-5]: ");
             default_local_proto = match filter_input.as_str() {
@@ -509,24 +509,23 @@ async fn main() -> Result<()> {
         _ => RunMode::Direct,
     };
 
-    // سوال جدید: استفاده از API ارسال دعوت یا فقط چک کردن اپلیکیشن
-    println!("\n🔧 Select API Usage:");
-    println!("1) Use Both APIs (Check App + Send Invite) - Default");
-    println!("2) Only Check App (API_CHECK_APP only)");
+    println!("\n🔧 Select Method:");
+    println!("1) Send Invite SMS");
+    println!("2) Don't Send Invite SMS");
     
     let api_input = prompt_input("Choice [1-2]: ");
     let use_send_invite = match api_input.as_str() {
         "2" => {
-            println!("⚠️  Only checking app (no invites will be sent)");
+            println!("✅ Only checking app (no invites SMS will be sent)");
             false
         },
         _ => {
-            println!("✅ Using both APIs (check app + send invite)");
+            println!("⚠️ Using Send Invite SMS Method");
             true
         }
     };
 
-    let concurrent_input = prompt_input("⚡ Requests PER PROXY (simultaneous): ");
+    let concurrent_input = prompt_input("⚡ Requests PER PROXY: ");
     let requests_per_proxy: usize = concurrent_input.parse().unwrap_or(5);
 
     let workers_input = prompt_input("👷 Total Worker Threads: ");
