@@ -33,7 +33,6 @@ enum RunMode {
 enum ProxyFilter {
     All,
     Http,
-    Https, // ✅ NEW: Explicit HTTPS filter
     Socks4,
     Socks5,
 }
@@ -61,8 +60,6 @@ struct AppConfig {
 struct ProxySourceConfig {
     #[serde(default)]
     http: Vec<String>,
-    #[serde(default)]
-    https: Vec<String>, // ✅ NEW: Support for "https" key in JSON
     #[serde(default)]
     socks4: Vec<String>,
     #[serde(default)]
@@ -103,14 +100,13 @@ async fn log_debug(msg: String) {
     if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
 }
 
-fn format_proxy_url(raw: &str, proto: &str) -> String {
+fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     let mut clean = raw.trim().to_string();
     
-    // Fix typos
     if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
+    if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
     
-    // Always upgrade SOCKS5 to SOCKS5h for remote DNS
-    if proto == "socks5" || proto == "socks5h" {
+    if default_proto == "socks5" || default_proto == "socks5h" {
         if clean.starts_with("socks5://") {
             return clean.replace("socks5://", "socks5h://");
         }
@@ -120,7 +116,7 @@ fn format_proxy_url(raw: &str, proto: &str) -> String {
     }
 
     if !clean.contains("://") { 
-        return format!("{}://{}", proto, clean); 
+        return format!("{}://{}", default_proto, clean); 
     }
     
     clean
@@ -152,7 +148,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     builder.build().context("Failed to build client")
 }
 
-// --- Fetch Logic (JSON Support) ---
+// --- Fetch Logic ---
 
 async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<String>> {
     println!("⏳ Connecting to GitHub to fetch proxy sources...");
@@ -188,22 +184,16 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
         })
     };
 
-    // ✅ UPDATED: Filter logic now handles explicit HTTPS
     match filter {
         ProxyFilter::All => {
             println!("🌐 Fetching ALL proxy types...");
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
-            for url in sources.https { tasks.push(spawn_download(url, "https", fetcher.clone())); }
             for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
         },
         ProxyFilter::Http => {
             println!("🌐 Fetching ONLY HTTP proxies...");
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
-        },
-        ProxyFilter::Https => {
-            println!("🌐 Fetching ONLY HTTPS proxies...");
-            for url in sources.https { tasks.push(spawn_download(url, "https", fetcher.clone())); }
         },
         ProxyFilter::Socks4 => {
             println!("🌐 Fetching ONLY SOCKS4 proxies...");
@@ -216,7 +206,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     }
 
     if tasks.is_empty() {
-        return Err(anyhow!("No sources found for the selected proxy type."));
+        return Err(anyhow!("No sources found for the selected type."));
     }
 
     println!("⬇️  Downloading from {} sources...", tasks.len());
@@ -257,7 +247,7 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     Ok(proxies)
 }
 
-// --- Robust Worker Logic ---
+// --- Worker Logic ---
 
 async fn run_worker_robust(
     worker_id: usize,
@@ -384,10 +374,7 @@ async fn perform_invite(
                                         let text2 = resp2.text().await.unwrap_or_default();
                                         if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
                                             if body2["message"] == "done" {
-                                                // Success with Step 2, handled below
-                                            } else {
-                                                if debug_mode { log_debug(format!("Worker {} Step 2 Logic Fail: {}", id, text2)).await; }
-                                                return ProxyStatus::SoftFail;
+                                                // Success with Step 2
                                             }
                                         }
                                     } else {
@@ -400,6 +387,7 @@ async fn perform_invite(
                             }
                         }
                         
+                        // Common success logic for both cases
                         let mut lock = success_counter.lock().await;
                         *lock += 1;
                         let current = *lock;
@@ -417,7 +405,7 @@ async fn perform_invite(
                         return ProxyStatus::Healthy;
                      }
                 }
-                return ProxyStatus::Healthy;
+                return ProxyStatus::Healthy; // Message was not "done", but connection is fine
             } else {
                 if debug_mode { log_debug(format!("Worker {} HTTP {} on {}", id, status_code, phone)).await; }
                 return ProxyStatus::SoftFail; 
@@ -457,23 +445,21 @@ async fn main() -> Result<()> {
     
     let mut proxy_filter = ProxyFilter::All;
     let mut default_local_proto = "socks5h"; 
-    let mut local_file_path = String::from("proxies.txt"); 
+    let mut local_file_path = String::from("socks5.txt"); 
 
     let mode = match mode_input.as_str() {
         "2" => {
             println!("\n🔍 Select Proxy Protocol to Download:");
             println!("1) All (Default) 🌍");
-            println!("2) HTTP 🌐");
-            println!("3) HTTPS 🔒");
-            println!("4) SOCKS4 🔌");
-            println!("5) SOCKS5 (Remote DNS) 🛡️");
+            println!("2) HTTP/HTTPS 🌐");
+            println!("3) SOCKS4 🔌");
+            println!("4) SOCKS5 (Remote DNS) 🛡️");
             
-            let filter_input = prompt_input("Choice [1-5]: ");
+            let filter_input = prompt_input("Choice [1-4]: ");
             proxy_filter = match filter_input.as_str() {
                 "2" => ProxyFilter::Http,
-                "3" => ProxyFilter::Https,
-                "4" => ProxyFilter::Socks4,
-                "5" => ProxyFilter::Socks5,
+                "3" => ProxyFilter::Socks4,
+                "4" => ProxyFilter::Socks5,
                 _ => ProxyFilter::All,
             };
             RunMode::AutoProxy
@@ -485,18 +471,16 @@ async fn main() -> Result<()> {
             }
 
             println!("\n🔍 Select Default Protocol for Local File:");
-            println!("1) Mixed/Auto (Respects schemes, defaults to SOCKS5h) ⚡");
-            println!("2) HTTP 🌐");
-            println!("3) HTTPS 🔒");
-            println!("4) SOCKS4 🔌");
-            println!("5) SOCKS5 (Remote DNS) 🛡️");
+            println!("1) Mixed/Auto (Respect schemes, default to SOCKS5) ⚡");
+            println!("2) HTTP/HTTPS 🌐");
+            println!("3) SOCKS4 🔌");
+            println!("4) SOCKS5 (Remote DNS) 🛡️");
             
-            let filter_input = prompt_input("Choice [1-5]: ");
+            let filter_input = prompt_input("Choice [1-4]: ");
             default_local_proto = match filter_input.as_str() {
                 "2" => "http",
-                "3" => "https",
-                "4" => "socks4",
-                "5" => "socks5h",
+                "3" => "socks4",
+                "4" => "socks5h",
                 _ => "socks5h",
             };
             RunMode::LocalProxy
@@ -510,8 +494,9 @@ async fn main() -> Result<()> {
     let workers_input = prompt_input("👷 Total Worker Threads: ");
     let worker_count: usize = workers_input.parse().unwrap_or(50);
     
+    // ✅ NEW: Ask user about step 2
     let send_invite_input = prompt_input("\n❓ Send Invite Notification (Step 2)? [Y/n]: ");
-    let use_send_invite = !send_invite_input.to_lowercase().starts_with('n');
+    let use_send_invite = !send_invite_input.to_lowercase().starts_with('n'); // Default to yes
 
     // --- PREPARE POOL ---
     let mut raw_pool: Vec<String> = Vec::new();
