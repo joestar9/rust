@@ -33,10 +33,9 @@ enum RunMode {
 enum ProxyFilter {
     All,
     Http,
-    Https,
+    Https, // ✅ NEW: Explicit HTTPS filter
     Socks4,
     Socks5,
-    Unknown, // ✅ NEW: Added Unknown filter
 }
 
 enum ProxyStatus {
@@ -63,13 +62,11 @@ struct ProxySourceConfig {
     #[serde(default)]
     http: Vec<String>,
     #[serde(default)]
-    https: Vec<String>,
+    https: Vec<String>, // ✅ NEW: Support for "https" key in JSON
     #[serde(default)]
     socks4: Vec<String>,
     #[serde(default)]
     socks5: Vec<String>,
-    #[serde(default)]
-    unknown: Vec<String>, // ✅ NEW: Support for "unknown"
 }
 
 // --- Helper Functions ---
@@ -108,31 +105,26 @@ async fn log_debug(msg: String) {
 
 fn format_proxy_url(raw: &str, proto: &str) -> String {
     let mut clean = raw.trim().to_string();
-    if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5h://"); }
-    if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5h://"); }
-    if clean.starts_with("socks5://") { clean = clean.replace("socks5://", "socks5h://"); }
-    if !clean.contains("://") { return format!("{}://{}", proto, clean); }
-    clean
-}
-
-/// ✅ NEW: Smart guessing function for "unknown" type
-fn guess_proxy_url(raw: &str) -> String {
-    let clean = raw.trim();
-    if clean.contains("://") {
-        return format_proxy_url(clean, "http"); // Sanitize existing scheme
-    }
-    if let Some(port_str) = clean.split(':').last() {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return match port {
-                1080 => format_proxy_url(clean, "socks5h"),
-                443 | 8443 => format_proxy_url(clean, "https"),
-                _ => format_proxy_url(clean, "http"),
-            };
+    
+    // Fix typos
+    if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
+    
+    // Always upgrade SOCKS5 to SOCKS5h for remote DNS
+    if proto == "socks5" || proto == "socks5h" {
+        if clean.starts_with("socks5://") {
+            return clean.replace("socks5://", "socks5h://");
+        }
+        if !clean.contains("://") {
+            return format!("socks5h://{}", clean);
         }
     }
-    format_proxy_url(clean, "http") // Fallback
-}
 
+    if !clean.contains("://") { 
+        return format!("{}://{}", proto, clean); 
+    }
+    
+    clean
+}
 
 // --- Client Factory ---
 
@@ -160,7 +152,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     builder.build().context("Failed to build client")
 }
 
-// --- Fetch Logic ---
+// --- Fetch Logic (JSON Support) ---
 
 async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<String>> {
     println!("⏳ Connecting to GitHub to fetch proxy sources...");
@@ -179,7 +171,6 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     let mut raw_proxies = HashSet::new();
     let mut tasks = Vec::new();
 
-    // Closure for known-protocol lists
     let spawn_download = |url: String, proto: &'static str, client: Client| {
         tokio::spawn(async move {
             let mut found = Vec::new();
@@ -196,25 +187,8 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
             found
         })
     };
-    
-    // Closure for "unknown" lists
-    let spawn_guess_download = |url: String, client: Client| {
-        tokio::spawn(async move {
-            let mut found = Vec::new();
-            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(15)).send().await {
-                if let Ok(text) = resp.text().await {
-                    for line in text.lines() {
-                        let p = line.trim();
-                        if !p.is_empty() && p.contains(':') {
-                            found.push(guess_proxy_url(p));
-                        }
-                    }
-                }
-            }
-            found
-        })
-    };
 
+    // ✅ UPDATED: Filter logic now handles explicit HTTPS
     match filter {
         ProxyFilter::All => {
             println!("🌐 Fetching ALL proxy types...");
@@ -222,7 +196,6 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
             for url in sources.https { tasks.push(spawn_download(url, "https", fetcher.clone())); }
             for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
-            for url in sources.unknown { tasks.push(spawn_guess_download(url, fetcher.clone())); }
         },
         ProxyFilter::Http => {
             println!("🌐 Fetching ONLY HTTP proxies...");
@@ -240,13 +213,11 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
             println!("🌐 Fetching ONLY SOCKS5 proxies...");
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
         },
-        ProxyFilter::Unknown => {
-            println!("🌐 Fetching UNKNOWN proxies (Smart Guess)...");
-            for url in sources.unknown { tasks.push(spawn_guess_download(url, fetcher.clone())); }
-        }
     }
 
-    if tasks.is_empty() { return Err(anyhow!("No sources found for the selected type.")); }
+    if tasks.is_empty() {
+        return Err(anyhow!("No sources found for the selected proxy type."));
+    }
 
     println!("⬇️  Downloading from {} sources...", tasks.len());
     
@@ -265,6 +236,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
 
 fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> {
     let clean_path = file_path.trim().trim_matches('"').trim_matches('\'');
+    
     let file = File::open(clean_path).context(format!("Could not open file: {}", clean_path))?;
     let reader = BufReader::new(file);
     let mut unique_set = HashSet::new();
@@ -279,12 +251,13 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
         }
     }
     
+    println!("🧹 Local List: Loaded {} unique proxies.", unique_set.len());
     let mut proxies: Vec<String> = unique_set.into_iter().collect();
     proxies.shuffle(&mut rand::rng());
     Ok(proxies)
 }
 
-// --- Worker Logic ---
+// --- Robust Worker Logic ---
 
 async fn run_worker_robust(
     worker_id: usize,
@@ -410,23 +383,31 @@ async fn perform_invite(
                                     if resp2.status().as_u16() == 200 {
                                         let text2 = resp2.text().await.unwrap_or_default();
                                         if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
-                                            if body2["message"] != "done" && debug_mode { 
-                                                log_debug(format!("Worker {} Step 2 Logic Fail: {}", id, text2)).await; 
+                                            if body2["message"] == "done" {
+                                                // Success with Step 2, handled below
+                                            } else {
+                                                if debug_mode { log_debug(format!("Worker {} Step 2 Logic Fail: {}", id, text2)).await; }
+                                                return ProxyStatus::SoftFail;
                                             }
                                         }
                                     } else {
                                         return ProxyStatus::SoftFail;
                                     }
                                 },
-                                Err(_) => { return ProxyStatus::HardFail; }
+                                Err(_) => {
+                                    return ProxyStatus::HardFail;
+                                }
                             }
                         }
                         
                         let mut lock = success_counter.lock().await;
                         *lock += 1;
                         let current = *lock;
-                        let action = if use_send_invite { "Sent" } else { "Checked" };
-                        println!("✅ Worker #{} | Proxy {} | {}: {} ({}/{})", id, proxy_name, action, phone, current, target);
+                        if use_send_invite {
+                            println!("✅ Worker #{} | Proxy {} | Sent: {} ({}/{})", id, proxy_name, phone, current, target);
+                        } else {
+                            println!("✅ Worker #{} | Proxy {} | Checked: {} ({}/{})", id, proxy_name, phone, current, target);
+                        }
 
                         if current >= target {
                             println!("🎉 Target reached! Stopping...");
@@ -486,15 +467,13 @@ async fn main() -> Result<()> {
             println!("3) HTTPS 🔒");
             println!("4) SOCKS4 🔌");
             println!("5) SOCKS5 (Remote DNS) 🛡️");
-            println!("6) Unknown (Smart Guess) 🤔"); // ✅ NEW
             
-            let filter_input = prompt_input("Choice [1-6]: ");
+            let filter_input = prompt_input("Choice [1-5]: ");
             proxy_filter = match filter_input.as_str() {
                 "2" => ProxyFilter::Http,
                 "3" => ProxyFilter::Https,
                 "4" => ProxyFilter::Socks4,
                 "5" => ProxyFilter::Socks5,
-                "6" => ProxyFilter::Unknown, // ✅ NEW
                 _ => ProxyFilter::All,
             };
             RunMode::AutoProxy
@@ -506,7 +485,7 @@ async fn main() -> Result<()> {
             }
 
             println!("\n🔍 Select Default Protocol for Local File:");
-            println!("1) Smart Guess (Based on Port) 🤔");
+            println!("1) Mixed/Auto (Respects schemes, defaults to SOCKS5h) ⚡");
             println!("2) HTTP 🌐");
             println!("3) HTTPS 🔒");
             println!("4) SOCKS4 🔌");
@@ -514,12 +493,11 @@ async fn main() -> Result<()> {
             
             let filter_input = prompt_input("Choice [1-5]: ");
             default_local_proto = match filter_input.as_str() {
-                "1" => "guess",
                 "2" => "http",
                 "3" => "https",
                 "4" => "socks4",
                 "5" => "socks5h",
-                _ => "guess",
+                _ => "socks5h",
             };
             RunMode::LocalProxy
         },
@@ -535,12 +513,15 @@ async fn main() -> Result<()> {
     let send_invite_input = prompt_input("\n❓ Send Invite Notification (Step 2)? [Y/n]: ");
     let use_send_invite = !send_invite_input.to_lowercase().starts_with('n');
 
+    // --- PREPARE POOL ---
     let mut raw_pool: Vec<String> = Vec::new();
 
     if mode == RunMode::LocalProxy {
         raw_pool = read_local_list(&local_file_path, default_local_proto)?;
+        println!("📦 Loaded {} local proxies.", raw_pool.len());
     } else if mode == RunMode::AutoProxy {
         raw_pool = fetch_proxies_list(token.clone(), proxy_filter).await?;
+        println!("📦 Downloaded {} proxies.", raw_pool.len());
     } else {
         raw_pool.push("Direct".to_string());
     }
