@@ -13,7 +13,6 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Semaphore, watch};
 use tokio::time::sleep;
 
-// --- Constants ---
 const CONFIG_FILE: &str = "config.json";
 const LOG_FILE: &str = "debug.log";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
@@ -21,7 +20,6 @@ const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.json";
 const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
 
-// --- Enums & Structs ---
 #[derive(Clone, Copy, PartialEq)]
 enum RunMode {
     Direct,
@@ -69,8 +67,6 @@ struct ProxySourceConfig {
     socks5: Vec<String>,
 }
 
-// --- Helper Functions ---
-
 fn read_config() -> Result<AppConfig> {
     if !std::path::Path::new(CONFIG_FILE).exists() {
         return Err(anyhow!("❌ '{}' not found.", CONFIG_FILE));
@@ -103,15 +99,12 @@ async fn log_debug(msg: String) {
     if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
 }
 
-/// ✅ UPDATED: Smart Protocol Detection & Port Heuristics
 fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     let mut clean = raw.trim().to_string();
     
-    // 1. Fix common typos
     if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
     if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
     
-    // 2. Optimization: Upgrade socks5 to socks5h (Remote DNS)
     if default_proto == "socks5" || default_proto == "socks5h" {
         if clean.starts_with("socks5://") {
             return clean.replace("socks5://", "socks5h://");
@@ -121,30 +114,23 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
         }
     }
 
-    // 3. Heuristic for HTTP vs HTTPS based on Port
-    // If user selected HTTP mode but no scheme is present, check port.
     if default_proto == "http" && !clean.contains("://") {
         if let Some(port_str) = clean.split(':').last() {
             if let Ok(port) = port_str.parse::<u16>() {
-                // Ports commonly used for HTTPS/SSL Proxies
                 if [443, 8443, 2053, 2083, 2087, 2096].contains(&port) {
                     return format!("https://{}", clean);
                 }
             }
         }
-        // Fallback to standard http
         return format!("http://{}", clean);
     }
 
-    // 4. Default Fallback
     if !clean.contains("://") { 
         return format!("{}://{}", default_proto, clean); 
     }
     
     clean
 }
-
-// --- Client Factory ---
 
 fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -169,8 +155,6 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
 
     builder.build().context("Failed to build client")
 }
-
-// --- Fetch Logic ---
 
 async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<String>> {
     println!("⏳ Connecting to GitHub to fetch proxy sources...");
@@ -274,8 +258,6 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     Ok(proxies)
 }
 
-// --- Robust Worker Logic ---
-
 async fn run_worker_robust(
     worker_id: usize,
     proxy_pool: Arc<Mutex<Vec<String>>>,
@@ -320,7 +302,6 @@ async fn run_worker_robust(
         if current_client.is_none() {
             let mut pool = proxy_pool.lock().await;
             if let Some(proxy_url) = pool.pop() {
-                // proxy_url is already formatted correctly
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
                         current_client = Some(c);
@@ -388,7 +369,6 @@ async fn perform_invite(
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                     if body["message"] == "done" {
-                        // اگر کاربر فقط چک کردن اپلیکیشن را انتخاب کرده باشد
                         if !use_send_invite {
                             let mut lock = success_counter.lock().await;
                             *lock += 1;
@@ -396,7 +376,6 @@ async fn perform_invite(
                             return ProxyStatus::Healthy;
                         }
                         
-                        // اگر کاربر ارسال دعوت را انتخاب کرده باشد
                         let res2 = client.post(API_SEND_INVITE)
                             .header("Referer", "https://my.irancell.ir/invite/confirm")
                             .json(&data).send().await;
@@ -531,7 +510,6 @@ async fn main() -> Result<()> {
     let workers_input = prompt_input("👷 Total Worker Threads: ");
     let worker_count: usize = workers_input.parse().unwrap_or(50);
 
-    // --- PREPARE POOL ---
     let mut raw_pool: Vec<String> = Vec::new();
 
     if mode == RunMode::LocalProxy {
