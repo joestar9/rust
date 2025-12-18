@@ -16,7 +16,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Ubuntu - Linux x64
           - name: ubuntu-latest / x64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -24,7 +23,6 @@ jobs:
             artifact_name: irancell_pro_invite_linux_x64
             is_android: false
 
-          # Windows - build x64 exe (runs on Windows 11 too)
           - name: windows-latest / x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -32,7 +30,6 @@ jobs:
             artifact_name: irancell_pro_invite_windows_x64.exe
             is_android: false
 
-          # Android / Termux - arm64-v8a
           - name: android / arm64-v8a
             os: ubuntu-latest
             target: aarch64-linux-android
@@ -45,7 +42,6 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # فقط برای Android: نصب NDK
       - name: Setup Android NDK
         if: ${{ matrix.is_android }}
         uses: nttld/setup-ndk@v1
@@ -73,7 +69,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           cargo install cargo-ndk --locked
-          echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"  # نمایش مسیر NDK
+          echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME" 
           cargo ndk -t ${{ matrix.android_abi }} build --release --target ${{ matrix.target }}
 
       - name: Prepare Artifacts
