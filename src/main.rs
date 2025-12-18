@@ -502,4 +502,90 @@ async fn main() -> Result<()> {
                 "1" => "guess",
                 "2" => "http",
                 "3" => "https",
+                "4" => "socks4",
+                "5" => "socks5h",
+                _ => "guess",
+            };
+            models::RunMode::LocalProxy
+        },
+        _ => models::RunMode::Direct,
+    };
+
+    let concurrent_input = utils::prompt_input("⚡ Requests PER PROXY (simultaneous): ");
+    let requests_per_proxy: usize = concurrent_input.parse().unwrap_or(5);
+
+    let workers_input = utils::prompt_input("👷 Total Worker Threads: ");
+    let worker_count: usize = workers_input.parse().unwrap_or(50);
+    
+    let send_invite_input = utils::prompt_input("\n❓ Send Invite Notification (Step 2)? [Y/n]: ");
+    let use_send_invite = !send_invite_input.to_lowercase().starts_with('n');
+
+    let mut raw_pool: Vec<String> = Vec::new();
+
+    if mode == models::RunMode::LocalProxy {
+        raw_pool = network::read_local_list(&local_file_path, default_local_proto)?;
+    } else if mode == models::RunMode::AutoProxy {
+        raw_pool = network::fetch_proxies_list(token.clone(), proxy_filter).await?;
+    } else {
+        raw_pool.push("Direct".to_string());
+    }
+
+    if raw_pool.is_empty() { return Err(anyhow!("❌ Pool is empty.")); }
+
+    let shared_pool = Arc::new(Mutex::new(raw_pool));
+    let success_counter = Arc::new(Mutex::new(0));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let prefixes = Arc::new(config.prefixes);
+
+    println!("🚀 Launching {} worker threads...", worker_count);
+
+    for id in 0..worker_count {
+        let pool = shared_pool.clone();
+        let token_clone = token.clone();
+        let p_ref = prefixes.clone();
+        let s_ref = success_counter.clone();
+        let rx = shutdown_rx.clone();
         
+        if mode == models::RunMode::Direct {
+            let client = network::build_client(&token_clone, None)?;
+            let sd_tx_clone = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let sem = Arc::new(Semaphore::new(requests_per_proxy));
+                loop {
+                    if *rx.borrow() { break; }
+                    if let Ok(permit) = sem.clone().acquire_owned().await {
+                        let c = client.clone();
+                        let pr = p_ref.clone();
+                        let sr = s_ref.clone();
+                        let sd_tx_inner = sd_tx_clone.clone();
+                        tokio::spawn(async move {
+                            let _p = permit;
+                            let prefix = pr.as_slice().choose(&mut rand::rng()).unwrap();
+                            let phone = format!("98{}{}", prefix, utils::generate_random_suffix());
+                            worker::perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count, use_send_invite, &sd_tx_inner).await;
+                        });
+                    }
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                worker::run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite).await;
+            });
+        }
+    }
+
+    let monitor_success = success_counter.clone();
+    
+    loop {
+        sleep(Duration::from_secs(1)).await;
+        if *monitor_success.lock().await >= target_count {
+            let _ = shutdown_tx.send(true);
+            break;
+        }
+    }
+
+    println!("🏁 Target reached. Stopping...");
+    sleep(Duration::from_secs(2)).await;
+    println!("\n📊 Final Results: {} Successes", *monitor_success.lock().await);
+    Ok(())
+}
