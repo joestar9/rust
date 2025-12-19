@@ -9,6 +9,7 @@ use std::fs::OpenOptions;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Semaphore, watch};
 use tokio::time::sleep;
@@ -81,7 +82,7 @@ fn read_config() -> Result<AppConfig> {
 fn generate_random_suffix() -> String {
     let chars: Vec<char> = "1234567890".chars().collect();
     let mut rng = rand::rng(); 
-    chars.choose_multiple(&mut rng, 7).collect()
+    (0..7).map(|_| *chars.choose(&mut rng).unwrap()).collect()
 }
 
 fn prompt_input(prompt: &str) -> String {
@@ -147,7 +148,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
         .tcp_nodelay(true)
         .cookie_store(true)
         .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(10));
+        .timeout(Duration::from_secs(15));
 
     if let Some(p) = proxy {
         builder = builder.proxy(p);
@@ -176,7 +177,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     let spawn_download = |url: String, proto: &'static str, client: Client| {
         tokio::spawn(async move {
             let mut found = Vec::new();
-            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(10)).send().await {
+            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(15)).send().await {
                 if let Ok(text) = resp.text().await {
                     for line in text.lines() {
                         let p = line.trim();
@@ -274,7 +275,7 @@ async fn run_worker_robust(
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
 
-    let mut current_client: Option<Client> = None;
+    let mut current_client: Option<(Client, Arc<AtomicBool>)> = None;
     let mut current_proxy_addr: String = String::new();
     let mut consecutive_errors: u8 = 0;
 
@@ -295,6 +296,9 @@ async fn run_worker_robust(
         if consecutive_errors >= MAX_RETRIES_BEFORE_SWITCH {
             if debug_mode { 
                 log_debug(format!("♻️ Worker {} switching. Failed: {}", worker_id, current_proxy_addr)).await; 
+            }
+            if let Some((_, active_flag)) = &current_client {
+                active_flag.store(false, Ordering::Relaxed);
             }
             current_client = None; 
             consecutive_errors = 0; 
@@ -320,7 +324,7 @@ async fn run_worker_robust(
             if let Some(proxy_url) = pool.pop() {
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
-                        current_client = Some(c);
+                        current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         current_proxy_addr = proxy_url;
                         consecutive_errors = 0;
                     }
@@ -332,17 +336,19 @@ async fn run_worker_robust(
             }
         }
 
-        if let Some(client) = current_client.clone() {
+        if let Some((client, active_flag)) = current_client.clone() {
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
                 let s_ref = success_counter.clone();
                 let p_addr = current_proxy_addr.clone();
                 let tx = status_tx.clone();
                 let s_rx = shutdown_rx.clone();
+                let flag_clone = active_flag.clone();
                 
                 tokio::spawn(async move {
                     let _p = permit; 
                     if *s_rx.borrow() { return; } 
+                    if !flag_clone.load(Ordering::Relaxed) { return; }
 
                     let prefix = p_ref.choose(&mut rand::rng()).unwrap();
                     let phone = format!("98{}{}", prefix, generate_random_suffix());
