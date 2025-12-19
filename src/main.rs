@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
-use reqwest::cookie::Jar; // Added for shared cookies
+use reqwest::cookie::Jar;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -135,7 +135,6 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     clean
 }
 
-// Updated: Accepts a shared cookie jar
 fn build_client(token: &str, proxy: Option<Proxy>, cookie_jar: Arc<Jar>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
@@ -149,7 +148,7 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_jar: Arc<Jar>) -> Resu
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
-        .cookie_provider(cookie_jar) // Key Change: Use shared jar
+        .cookie_provider(cookie_jar)
         .pool_idle_timeout(Duration::from_secs(90))
         .connect_timeout(Duration::from_secs(10)) 
         .timeout(Duration::from_secs(20));
@@ -292,7 +291,7 @@ async fn run_worker_robust(
     debug_mode: bool,
     use_send_invite: bool,
     refill_filter: Option<ProxyFilter>,
-    shared_jar: Arc<Jar> // Receive shared jar
+    shared_jar: Arc<Jar>
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -351,7 +350,6 @@ async fn run_worker_robust(
                 }
 
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
-                    // Pass shared_jar here
                     if let Ok(c) = build_client(&token, Some(proxy_obj), shared_jar.clone()) {
                         current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         current_proxy_addr = proxy_url;
@@ -579,8 +577,7 @@ async fn main() -> Result<()> {
     let success_counter = Arc::new(Mutex::new(0));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
-    
-    // Create ONE cookie jar for EVERYONE
+
     let global_cookie_jar = Arc::new(Jar::default());
 
     println!("🚀 Launching {} worker threads...", worker_count);
@@ -591,12 +588,12 @@ async fn main() -> Result<()> {
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
         let rx = shutdown_rx.clone();
-        let jar_ref = global_cookie_jar.clone(); // Pass the jar
+        let jar_ref = global_cookie_jar.clone();
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
         if mode == RunMode::Direct {
-            let client = build_client(&token_clone, None, jar_ref)?; // Pass jar
+            let client = build_client(&token_clone, None, jar_ref)?;
             tokio::spawn(async move {
                 let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
