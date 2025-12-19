@@ -2,12 +2,14 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
+use reqwest::cookie::Jar; // Added for shared cookies
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -133,7 +135,8 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     clean
 }
 
-fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
+// Updated: Accepts a shared cookie jar
+fn build_client(token: &str, proxy: Option<Proxy>, cookie_jar: Arc<Jar>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
@@ -146,9 +149,10 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
-        .cookie_store(true)
+        .cookie_provider(cookie_jar) // Key Change: Use shared jar
         .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(15));
+        .connect_timeout(Duration::from_secs(10)) 
+        .timeout(Duration::from_secs(20));
 
     if let Some(p) = proxy {
         builder = builder.proxy(p);
@@ -259,6 +263,23 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     Ok(proxies)
 }
 
+fn check_tcp_connectivity(proxy_url: &str) -> bool {
+    let address_part = if let Some(idx) = proxy_url.find("://") {
+        &proxy_url[idx + 3..]
+    } else {
+        proxy_url
+    };
+
+    if let Ok(addrs) = address_part.to_socket_addrs() {
+        for addr in addrs {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 async fn run_worker_robust(
     worker_id: usize,
     proxy_pool: Arc<Mutex<Vec<String>>>,
@@ -270,7 +291,8 @@ async fn run_worker_robust(
     shutdown_rx: watch::Receiver<bool>,
     debug_mode: bool,
     use_send_invite: bool,
-    refill_filter: Option<ProxyFilter>
+    refill_filter: Option<ProxyFilter>,
+    shared_jar: Arc<Jar> // Receive shared jar
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -322,8 +344,15 @@ async fn run_worker_robust(
             let mut pool = proxy_pool.lock().await;
 
             if let Some(proxy_url) = pool.pop() {
+                drop(pool); 
+                
+                if !check_tcp_connectivity(&proxy_url) {
+                    continue; 
+                }
+
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
-                    if let Ok(c) = build_client(&token, Some(proxy_obj)) {
+                    // Pass shared_jar here
+                    if let Ok(c) = build_client(&token, Some(proxy_obj), shared_jar.clone()) {
                         current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         current_proxy_addr = proxy_url;
                         consecutive_errors = 0;
@@ -550,6 +579,9 @@ async fn main() -> Result<()> {
     let success_counter = Arc::new(Mutex::new(0));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
+    
+    // Create ONE cookie jar for EVERYONE
+    let global_cookie_jar = Arc::new(Jar::default());
 
     println!("🚀 Launching {} worker threads...", worker_count);
 
@@ -559,11 +591,12 @@ async fn main() -> Result<()> {
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
         let rx = shutdown_rx.clone();
+        let jar_ref = global_cookie_jar.clone(); // Pass the jar
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
         if mode == RunMode::Direct {
-            let client = build_client(&token_clone, None)?;
+            let client = build_client(&token_clone, None, jar_ref)?; // Pass jar
             tokio::spawn(async move {
                 let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
@@ -583,7 +616,7 @@ async fn main() -> Result<()> {
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite, refill_filter).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite, refill_filter, jar_ref).await;
             });
         }
     }
