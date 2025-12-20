@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering}; // استفاده از Atomic
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Semaphore, watch};
 use tokio::time::sleep;
@@ -20,8 +20,8 @@ const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.json";
 const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
 
-// تعریف کاراکترها به صورت ثابت برای جلوگیری از Allocation در هر درخواست
-const DIGITS: &[u8] = b"0123456789";
+const PRIME_MULTIPLIER: usize = 6_786_793; 
+const MODULO_SPACE: usize = 10_000_000;
 
 #[derive(Clone, Copy, PartialEq)]
 enum RunMode {
@@ -80,15 +80,26 @@ fn read_config() -> Result<AppConfig> {
     Ok(config)
 }
 
-// نسخه بسیار سریع‌تر تولید شماره بدون فشار به رم
-fn generate_random_suffix() -> String {
-    let mut rng = rand::rng();
-    let mut result = String::with_capacity(7);
-    for _ in 0..7 {
-        let idx = rng.random_range(0..DIGITS.len());
-        result.push(DIGITS[idx] as char);
-    }
-    result
+// تابع جدید: تولید شماره یونیک بر اساس ایندکس اتمیک
+fn generate_unique_number(global_index: usize, start_offset: usize, prefixes: &[String]) -> String {
+    // 1. انتخاب پیش‌شماره بر اساس نوبت (Round Robin)
+    let prefix_idx = global_index % prefixes.len();
+    let prefix = &prefixes[prefix_idx];
+
+    // 2. محاسبه سید برای سافیکس (بخش ۷ رقمی)
+    // تقسیم بر تعداد پیش‌شماره‌ها باعث می‌شود برای هر پیش‌شماره شمارنده جداگانه‌ای داشته باشیم
+    let sequence_num = global_index / prefixes.len();
+
+    // 3. اعمال آفست تصادفی اولیه (برای اینکه هر بار اجرا شماره‌های متفاوتی بدهد)
+    let effective_index = sequence_num + start_offset;
+
+    // 4. تبدیل خطی به تصادفی-یونیک (Modular Multiplication)
+    // فرمول: (Index * LargePrime) % 10,000,000
+    // این ریاضیات تضمین می‌کند هیچ تکراری رخ ندهد.
+    let unique_suffix_val = (effective_index * PRIME_MULTIPLIER) % MODULO_SPACE;
+
+    // 5. فرمت‌دهی به صورت ۷ رقم با صفر اول (مثلا 0123456)
+    format!("98{}{:07}", prefix, unique_suffix_val)
 }
 
 fn prompt_input(prompt: &str) -> String {
@@ -272,8 +283,10 @@ async fn run_worker_robust(
     token: String,
     concurrency_limit: usize,
     prefixes: Arc<Vec<String>>,
-    success_counter: Arc<AtomicUsize>, // تغییر به Atomic
-    failure_counter: Arc<AtomicUsize>, // تغییر به Atomic
+    success_counter: Arc<AtomicUsize>,
+    failure_counter: Arc<AtomicUsize>,
+    global_index_counter: Arc<AtomicUsize>, // شمارنده سراسری برای یونیک بودن
+    start_offset: usize, // افست تصادفی
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
     use_send_invite: bool,
@@ -340,22 +353,25 @@ async fn run_worker_robust(
         }
 
         if let Some((client, active_flag)) = current_client.clone() {
-            // استفاده از acquire_owned منتظر می‌ماند، بنابراین نیازی به sleep اضافه نیست
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
                 let s_ref = success_counter.clone();
                 let f_ref = failure_counter.clone();
+                let idx_ref = global_index_counter.clone();
                 let tx = status_tx.clone();
                 let s_rx = shutdown_rx.clone();
                 let flag_clone = active_flag.clone();
+                let offset_val = start_offset;
                 
                 tokio::spawn(async move {
                     let _p = permit; 
                     if *s_rx.borrow() { return; } 
                     if !flag_clone.load(Ordering::Relaxed) { return; }
 
-                    let prefix = p_ref.choose(&mut rand::rng()).unwrap();
-                    let phone = format!("98{}{}", prefix, generate_random_suffix());
+                    // دریافت ایندکس منحصر به فرد بعدی
+                    let current_idx = idx_ref.fetch_add(1, Ordering::Relaxed);
+                    // تولید شماره موبایل یونیک
+                    let phone = generate_unique_number(current_idx, offset_val, &p_ref);
 
                     let status = perform_invite(&client, phone, &s_ref, &f_ref, target, use_send_invite).await;
                     let _ = tx.send(status).await;
@@ -368,12 +384,11 @@ async fn run_worker_robust(
 async fn perform_invite(
     client: &Client,
     phone: String,
-    success_counter: &Arc<AtomicUsize>, // تغییر نوع ورودی
-    failure_counter: &Arc<AtomicUsize>, // تغییر نوع ورودی
+    success_counter: &Arc<AtomicUsize>,
+    failure_counter: &Arc<AtomicUsize>,
     target: usize,
     use_send_invite: bool
 ) -> ProxyStatus {
-    // خواندن Atomic بدون قفل
     if success_counter.load(Ordering::Relaxed) >= target { return ProxyStatus::Healthy; }
 
     let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
@@ -395,7 +410,7 @@ async fn perform_invite(
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                     if body["message"] == "done" {
                         if !use_send_invite {
-                            success_counter.fetch_add(1, Ordering::Relaxed); // افزایش اتمیک
+                            success_counter.fetch_add(1, Ordering::Relaxed);
                             return ProxyStatus::Healthy;
                         }
                         
@@ -409,7 +424,7 @@ async fn perform_invite(
                                     let text2 = resp2.text().await.unwrap_or_default();
                                     if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
                                         if body2["message"] == "done" {
-                                            success_counter.fetch_add(1, Ordering::Relaxed); // افزایش اتمیک
+                                            success_counter.fetch_add(1, Ordering::Relaxed);
                                             return ProxyStatus::Healthy;
                                         }
                                     }
@@ -549,9 +564,13 @@ async fn main() -> Result<()> {
     }
 
     let shared_pool = Arc::new(Mutex::new(raw_pool));
-    // استفاده از Atomic برای پرفورمنس بالا
     let success_counter = Arc::new(AtomicUsize::new(0));
     let failure_counter = Arc::new(AtomicUsize::new(0));
+    
+    // شمارنده سراسری برای تولید شماره منحصر به فرد
+    let global_index_counter = Arc::new(AtomicUsize::new(0));
+    // ایجاد یک آفست رندوم در شروع برنامه تا در اجراهای مختلف شماره‌ها تکراری نشوند
+    let start_offset = rand::rng().random_range(0..MODULO_SPACE);
     
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
@@ -567,6 +586,7 @@ async fn main() -> Result<()> {
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
         let f_ref = failure_counter.clone();
+        let idx_ref = global_index_counter.clone(); // پاس دادن رفرنس به شمارنده
         let rx = shutdown_rx.clone();
         let jar_ref = shared_jar.clone(); 
         
@@ -583,10 +603,12 @@ async fn main() -> Result<()> {
                         let pr = p_ref.clone();
                         let sr = s_ref.clone();
                         let fr = f_ref.clone();
+                        let ir = idx_ref.clone();
                         tokio::spawn(async move {
                             let _p = permit;
-                            let prefix = pr.choose(&mut rand::rng()).unwrap();
-                            let phone = format!("98{}{}", prefix, generate_random_suffix());
+                            // تولید شماره یونیک در حالت دایرکت
+                            let current_idx = ir.fetch_add(1, Ordering::Relaxed);
+                            let phone = generate_unique_number(current_idx, start_offset, &pr);
                             perform_invite(&c, phone, &sr, &fr, target_count, use_send_invite).await;
                         });
                     }
@@ -594,7 +616,7 @@ async fn main() -> Result<()> {
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, f_ref, target_count, rx, use_send_invite, refill_filter, jar_ref).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, f_ref, idx_ref, start_offset, target_count, rx, use_send_invite, refill_filter, jar_ref).await;
             });
         }
     }
