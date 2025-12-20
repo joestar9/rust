@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex, Semaphore, watch};
+use tokio::sync::{mpsc, Semaphore, watch};
 use tokio::time::sleep;
 
 const CONFIG_FILE: &str = "config.json";
@@ -641,8 +641,7 @@ async fn main() -> Result<()> {
     if raw_pool.is_empty() { return Err(anyhow!("❌ Pool is empty.")); }
 
     let shared_cookie = Arc::new(get_initial_cookie_string(&token).await.unwrap_or_default());
-    let (proxy_tx, _) = mpsc::channel(20000); 
-
+    
     let success_counter = Arc::new(AtomicUsize::new(0));
     let error_stats = Arc::new(ErrorStats::new());
     let global_index_counter = Arc::new(AtomicUsize::new(0));
@@ -656,8 +655,6 @@ async fn main() -> Result<()> {
     print!("\x1B[2J\x1B[1;1H");
 
     for _ in 0..worker_count {
-        let (ptx, prx) = mpsc::channel(100); 
-        
         let token_clone = token.clone();
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
@@ -665,8 +662,6 @@ async fn main() -> Result<()> {
         let idx_ref = global_index_counter.clone();
         let rx = shutdown_rx.clone();
         let cookie_ref = shared_cookie.clone();
-        
-        let manager_tx = proxy_tx.clone();
         
         if mode == RunMode::Direct {
             let client = build_client(&token_clone, None, &cookie_ref)?;
@@ -704,10 +699,6 @@ async fn main() -> Result<()> {
                 run_worker_robust(0, w_rx, token_clone, requests_per_proxy, p_ref, s_ref, err_ref, idx_ref, start_offset, target_count, rx, use_send_invite, cookie_ref).await;
             });
         }
-    }
-
-    if mode == RunMode::AutoProxy {
-        
     }
 
     let monitor_success = success_counter.clone();
