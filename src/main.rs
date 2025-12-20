@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Semaphore, watch};
+use tokio::sync::{mpsc, Mutex, Semaphore, watch};
 use tokio::time::sleep;
 
 const CONFIG_FILE: &str = "config.json";
@@ -69,13 +69,13 @@ struct ProxySourceConfig {
 
 struct ErrorStats {
     proxy_errors: AtomicUsize, 
-    forbidden_bans: AtomicUsize,
-    unauthorized: AtomicUsize,
-    not_found: AtomicUsize,
-    bad_requests: AtomicUsize,
-    server_errors: AtomicUsize,
-    logic_fail: AtomicUsize,
-    parse_fail: AtomicUsize,
+    forbidden_bans: AtomicUsize, // 403, 429
+    unauthorized: AtomicUsize, // 401
+    not_found: AtomicUsize, // 404
+    bad_requests: AtomicUsize, // 400
+    server_errors: AtomicUsize, // 500-599
+    logic_fail: AtomicUsize, // 200 OK but message != done
+    parse_fail: AtomicUsize, // 200 OK but invalid JSON/HTML
     others: AtomicUsize, 
 }
 
@@ -137,6 +137,7 @@ fn prompt_input(prompt: &str) -> String {
 
 fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     let mut clean = raw.trim().to_string();
+    
     if clean.starts_with("soks5://") { clean = clean.replace("soks5://", "socks5://"); }
     if clean.starts_with("sock5://") { clean = clean.replace("sock5://", "socks5://"); }
     
@@ -148,6 +149,7 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
             return format!("socks5h://{}", clean);
         }
     }
+
     if default_proto == "http" && !clean.contains("://") {
         if let Some(port_str) = clean.split(':').last() {
             if let Ok(port) = port_str.parse::<u16>() {
@@ -158,14 +160,17 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
         }
         return format!("http://{}", clean);
     }
+
     if !clean.contains("://") { 
         return format!("{}://{}", default_proto, clean); 
     }
+    
     clean
 }
 
 async fn get_initial_cookie_string(token: &str) -> Result<String> {
     println!("🍪 Fetching initial cookies...");
+    
     let mut headers = HeaderMap::new();
     headers.insert("Authorization", HeaderValue::from_str(token)?);
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
@@ -175,6 +180,7 @@ async fn get_initial_cookie_string(token: &str) -> Result<String> {
         .cookie_store(true) 
         .timeout(Duration::from_secs(10))
         .build()?;
+
     let resp = client.get(API_CHECK_APP).send().await?;
     
     let cookies: Vec<String> = resp.headers()
@@ -183,10 +189,12 @@ async fn get_initial_cookie_string(token: &str) -> Result<String> {
         .map(|v| v.to_str().unwrap_or("").split(';').next().unwrap_or("").to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
     if cookies.is_empty() {
         println!("⚠️ No cookies received from server. Proceeding without cookies.");
         return Ok(String::new());
     }
+
     let cookie_string = cookies.join("; ");
     println!("✅ Cookies acquired: {}", cookie_string);
     Ok(cookie_string)
@@ -201,11 +209,13 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_string: &str) -> Resul
     headers.insert("x-app-version", "9.62.0".parse().unwrap());
     headers.insert("Authorization", HeaderValue::from_str(token)?);
     headers.insert("Content-Type", "application/json".parse().unwrap());
+
     if !cookie_string.is_empty() {
         if let Ok(val) = HeaderValue::from_str(cookie_string) {
             headers.insert(COOKIE, val);
         }
     }
+
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
@@ -214,22 +224,28 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_string: &str) -> Resul
         .pool_idle_timeout(Duration::from_secs(10))
         .cookie_store(false)
         .timeout(Duration::from_secs(10));
+
     if let Some(p) = proxy {
         builder = builder.proxy(p);
     }
+
     builder.build().context("Failed to build client")
 }
 
-async fn fetch_proxies_list(_token: Arc<String>, filter: ProxyFilter) -> Result<Vec<String>> {
+async fn fetch_proxies_list(_token: String, filter: ProxyFilter, silent: bool) -> Result<Vec<String>> {
+    if !silent { println!("⏳ Connecting to GitHub to fetch proxy sources..."); }
     let fetcher = Client::builder().timeout(Duration::from_secs(30)).build()?;
+    
     let json_text = match fetcher.get(SOURCE_OF_SOURCES_URL).send().await {
         Ok(res) => res.text().await?,
         Err(e) => return Err(anyhow!("Failed to fetch source JSON: {}", e)),
     };
+
     let sources: ProxySourceConfig = match serde_json::from_str(&json_text) {
         Ok(s) => s,
         Err(e) => return Err(anyhow!("Invalid JSON format in source file: {}", e)),
     };
+
     let mut raw_proxies = HashSet::new();
     let mut tasks = Vec::new();
 
@@ -252,28 +268,35 @@ async fn fetch_proxies_list(_token: Arc<String>, filter: ProxyFilter) -> Result<
 
     match filter {
         ProxyFilter::All => {
+            if !silent { println!("🌐 Fetching ALL proxy types..."); }
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
             for url in sources.https { tasks.push(spawn_download(url, "https", fetcher.clone())); }
             for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
         },
         ProxyFilter::Http => {
+            if !silent { println!("🌐 Fetching ONLY HTTP proxies..."); }
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
         },
         ProxyFilter::Https => {
+            if !silent { println!("🌐 Fetching ONLY HTTPS proxies..."); }
             for url in sources.https { tasks.push(spawn_download(url, "https", fetcher.clone())); }
         },
         ProxyFilter::Socks4 => {
+            if !silent { println!("🌐 Fetching ONLY SOCKS4 proxies..."); }
             for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
         },
         ProxyFilter::Socks5 => {
+            if !silent { println!("🌐 Fetching ONLY SOCKS5 proxies..."); }
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
         },
     }
 
     if tasks.is_empty() {
-        return Err(anyhow!("No sources found"));
+        return Err(anyhow!("No sources found for the selected type."));
     }
+
+    if !silent { println!("⬇️  Downloading from {} sources...", tasks.len()); }
     
     for task in tasks {
         if let Ok(proxies) = task.await {
@@ -290,10 +313,13 @@ async fn fetch_proxies_list(_token: Arc<String>, filter: ProxyFilter) -> Result<
 
 fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> {
     let clean_path = file_path.trim().trim_matches('"').trim_matches('\'');
+    
     let file = File::open(clean_path).context(format!("Could not open file: {}", clean_path))?;
     let reader = BufReader::new(file);
     let mut unique_set = HashSet::new();
+
     println!("📁 Processing local proxies from '{}'...", clean_path);
+    
     for line in reader.lines() {
         if let Ok(l) = line {
             let p = l.trim().to_string();
@@ -302,47 +328,17 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
             }
         }
     }
+    
     println!("🧹 Local List: Loaded {} unique proxies.", unique_set.len());
     let mut proxies: Vec<String> = unique_set.into_iter().collect();
     proxies.shuffle(&mut rand::rng());
     Ok(proxies)
 }
 
-async fn proxy_manager(
-    tx: mpsc::Sender<String>,
-    token: Arc<String>,
-    filter: ProxyFilter,
-    mode: RunMode,
-    initial_pool: Vec<String>
-) {
-    if !initial_pool.is_empty() {
-        for p in initial_pool {
-            if tx.send(p).await.is_err() { return; }
-        }
-    }
-
-    if mode != RunMode::AutoProxy {
-        return;
-    }
-
-    loop {
-        if tx.capacity() > 500 {
-            if let Ok(new_proxies) = fetch_proxies_list(token.clone(), filter).await {
-                for p in new_proxies {
-                    if tx.send(p).await.is_err() { return; }
-                }
-            } else {
-                sleep(Duration::from_secs(5)).await;
-            }
-        }
-        sleep(Duration::from_secs(2)).await;
-    }
-}
-
 async fn run_worker_robust(
     _worker_id: usize,
-    mut proxy_rx: mpsc::Receiver<String>,
-    token: Arc<String>,
+    proxy_pool: Arc<Mutex<Vec<String>>>,
+    token: String,
     concurrency_limit: usize,
     prefixes: Arc<Vec<String>>,
     success_counter: Arc<AtomicUsize>,
@@ -352,6 +348,7 @@ async fn run_worker_robust(
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
     use_send_invite: bool,
+    refill_filter: Option<ProxyFilter>,
     cookie_str: Arc<String>
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
@@ -382,15 +379,31 @@ async fn run_worker_robust(
         }
 
         if current_client.is_none() {
-            if let Some(proxy_url) = proxy_rx.recv().await {
-                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
+            let needs_refill = {
+                let pool = proxy_pool.lock().await;
+                pool.is_empty()
+            };
+
+            if needs_refill {
+                if let Some(filter) = refill_filter {
+                    if let Ok(new_proxies) = fetch_proxies_list(token.clone(), filter, true).await {
+                        let mut pool = proxy_pool.lock().await;
+                        pool.extend(new_proxies);
+                    }
+                }
+            }
+
+            let mut pool = proxy_pool.lock().await;
+            if let Some(proxy_url) = pool.pop() {
+                if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj), &cookie_str) {
                         current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         consecutive_errors = 0;
                     }
                 }
             } else {
-                sleep(Duration::from_secs(1)).await;
+                drop(pool);
+                sleep(Duration::from_secs(5)).await;
                 continue;
             }
         }
@@ -409,6 +422,7 @@ async fn run_worker_robust(
                     let _p = permit; 
                     if *s_rx.borrow() { return; } 
                     if !flag_clone.load(Ordering::Relaxed) { return; }
+
                     let current_idx = idx_ref.fetch_add(1, Ordering::Relaxed);
                     let phone = generate_unique_number(current_idx, start_offset, &p_ref);
                     
@@ -544,13 +558,14 @@ async fn perform_invite(
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = read_config()?;
-    let token_raw = match config.token {
+    
+    let token = match config.token {
         Some(t) if !t.trim().is_empty() => t,
         _ => prompt_input("🔑 Enter Token: "),
     };
-    let token = Arc::new(token_raw);
 
     println!("📱 Loaded {} prefixes.", config.prefixes.len());
+
     let count_input = prompt_input("🎯 Target SUCCESS Count: ");
     let target_count: usize = count_input.parse().unwrap_or(1000);
 
@@ -560,6 +575,7 @@ async fn main() -> Result<()> {
     println!("3) Local Proxy Mode (File) 📁");
     
     let mode_input = prompt_input("Choice [1-3]: ");
+    
     let mut proxy_filter = ProxyFilter::All;
     let mut default_local_proto = "socks5h"; 
     let mut local_file_path = String::from("socks5.txt"); 
@@ -572,6 +588,7 @@ async fn main() -> Result<()> {
             println!("3) HTTPS 🔒");
             println!("4) SOCKS4 🔌");
             println!("5) SOCKS5 🛡️");
+            
             let filter_input = prompt_input("Choice [1-5]: ");
             proxy_filter = match filter_input.as_str() {
                 "2" => ProxyFilter::Http,
@@ -587,12 +604,14 @@ async fn main() -> Result<()> {
             if !path_input.trim().is_empty() {
                 local_file_path = path_input;
             }
+
             println!("\n🔍 Select Default Protocol for Local File:");
             println!("1) Mixed/Auto (Respect schemes, default to SOCKS5) ⚡");
             println!("2) HTTP 🌐");
             println!("3) HTTPS 🔒");
             println!("4) SOCKS4 🔌");
             println!("5) SOCKS5 🛡️");
+            
             let filter_input = prompt_input("Choice [1-5]: ");
             default_local_proto = match filter_input.as_str() {
                 "2" => "http",
@@ -609,6 +628,7 @@ async fn main() -> Result<()> {
     println!("\n🔧 Select Method:");
     println!("1) Send Invite SMS");
     println!("2) Don't Send Invite SMS");
+    
     let api_input = prompt_input("Choice [1-2]: ");
     let use_send_invite = match api_input.as_str() {
         "2" => {
@@ -623,16 +643,17 @@ async fn main() -> Result<()> {
 
     let concurrent_input = prompt_input("⚡ Requests PER Worker: ");
     let requests_per_proxy: usize = concurrent_input.parse().unwrap_or(5);
+
     let workers_input = prompt_input("👷 Total Worker Threads: ");
     let worker_count: usize = workers_input.parse().unwrap_or(50);
 
     let mut raw_pool: Vec<String> = Vec::new();
+
     if mode == RunMode::LocalProxy {
         raw_pool = read_local_list(&local_file_path, default_local_proto)?;
         println!("📦 Loaded {} local proxies.", raw_pool.len());
     } else if mode == RunMode::AutoProxy {
-        println!("⏳ Downloading initial proxies...");
-        raw_pool = fetch_proxies_list(token.clone(), proxy_filter).await?;
+        raw_pool = fetch_proxies_list(token.clone(), proxy_filter, false).await?;
         println!("📦 Downloaded {} proxies.", raw_pool.len());
     } else {
         raw_pool.push("Direct".to_string());
@@ -641,9 +662,12 @@ async fn main() -> Result<()> {
     if raw_pool.is_empty() { return Err(anyhow!("❌ Pool is empty.")); }
 
     let shared_cookie = Arc::new(get_initial_cookie_string(&token).await.unwrap_or_default());
+    let shared_pool = Arc::new(Mutex::new(raw_pool));
     
     let success_counter = Arc::new(AtomicUsize::new(0));
+    
     let error_stats = Arc::new(ErrorStats::new());
+
     let global_index_counter = Arc::new(AtomicUsize::new(0));
     let start_offset = rand::rng().random_range(0..MODULO_SPACE);
     
@@ -654,7 +678,8 @@ async fn main() -> Result<()> {
     sleep(Duration::from_secs(1)).await;
     print!("\x1B[2J\x1B[1;1H");
 
-    for _ in 0..worker_count {
+    for id in 0..worker_count {
+        let pool = shared_pool.clone();
         let token_clone = token.clone();
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
@@ -663,6 +688,8 @@ async fn main() -> Result<()> {
         let rx = shutdown_rx.clone();
         let cookie_ref = shared_cookie.clone();
         
+        let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
+
         if mode == RunMode::Direct {
             let client = build_client(&token_clone, None, &cookie_ref)?;
             tokio::spawn(async move {
@@ -686,17 +713,8 @@ async fn main() -> Result<()> {
                 }
             });
         } else {
-            let (w_tx, w_rx) = mpsc::channel(50);
-            let pool_copy = raw_pool.clone(); 
-            let t_clone = token.clone();
-            let f_clone = proxy_filter;
-            
             tokio::spawn(async move {
-                proxy_manager(w_tx, t_clone, f_clone, mode, pool_copy).await;
-            });
-
-            tokio::spawn(async move {
-                run_worker_robust(0, w_rx, token_clone, requests_per_proxy, p_ref, s_ref, err_ref, idx_ref, start_offset, target_count, rx, use_send_invite, cookie_ref).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, err_ref, idx_ref, start_offset, target_count, rx, use_send_invite, refill_filter, cookie_ref).await;
             });
         }
     }
@@ -709,6 +727,7 @@ async fn main() -> Result<()> {
     loop {
         sleep(Duration::from_secs(2)).await;
         let success = monitor_success.load(Ordering::Relaxed);
+        
         let proxy_errs = monitor_errors.proxy_errors.load(Ordering::Relaxed);
         let bans = monitor_errors.forbidden_bans.load(Ordering::Relaxed);
         let unauth = monitor_errors.unauthorized.load(Ordering::Relaxed);
@@ -719,8 +738,9 @@ async fn main() -> Result<()> {
         let parse = monitor_errors.parse_fail.load(Ordering::Relaxed);
         let others = monitor_errors.others.load(Ordering::Relaxed);
         let total_fails = monitor_errors.total();
-        
+
         print!("\x1B[2J\x1B[1;1H"); 
+        
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("           🚀 IRANCELL INVITE BOT STATUS         ");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -745,7 +765,21 @@ async fn main() -> Result<()> {
             break;
         }
     }
+
     println!("🏁 Target reached. Stopping...");
     sleep(Duration::from_secs(2)).await;
+
+    println!("\n📊 Final Results:");
+    println!("✅ Successes: {}", success_counter.load(Ordering::Relaxed));
+    println!("🔌 Proxy Errors: {}", error_stats.proxy_errors.load(Ordering::Relaxed));
+    println!("🚫 Bans/Forbidden: {}", error_stats.forbidden_bans.load(Ordering::Relaxed));
+    println!("🔐 Unauthorized: {}", error_stats.unauthorized.load(Ordering::Relaxed));
+    println!("🔍 Not Found: {}", error_stats.not_found.load(Ordering::Relaxed));
+    println!("⚠️ Bad Requests: {}", error_stats.bad_requests.load(Ordering::Relaxed));
+    println!("🔥 Server Errors: {}", error_stats.server_errors.load(Ordering::Relaxed));
+    println!("🧠 Logic Fails: {}", error_stats.logic_fail.load(Ordering::Relaxed));
+    println!("📄 Parse Fails: {}", error_stats.parse_fail.load(Ordering::Relaxed));
+    println!("❓ Others: {}", error_stats.others.load(Ordering::Relaxed));
+    
     Ok(())
 }
