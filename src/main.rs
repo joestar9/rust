@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
-use reqwest::cookie::Jar; // اضافه شد
+use reqwest::cookie::Jar;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -125,7 +125,6 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     clean
 }
 
-// تغییر: اضافه کردن آرگومان cookie_store به سازنده کلاینت
 fn build_client(token: &str, proxy: Option<Proxy>, cookie_store: Arc<Jar>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
@@ -139,7 +138,7 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_store: Arc<Jar>) -> Re
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
-        .cookie_provider(cookie_store) // تغییر: استفاده از مخزن کوکی اشتراکی
+        .cookie_provider(cookie_store)
         .pool_idle_timeout(Duration::from_secs(90))
         .timeout(Duration::from_secs(15));
 
@@ -252,6 +251,23 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     Ok(proxies)
 }
 
+// تابع جدید برای ساخت نوار پیشرفت
+fn generate_progress_bar(current: usize, total: usize) -> String {
+    let bar_width = 30;
+    let ratio = if total == 0 { 0.0 } else { current as f64 / total as f64 };
+    let filled_len = (ratio * bar_width as f64).round() as usize;
+    let empty_len = if filled_len > bar_width { 0 } else { bar_width - filled_len };
+    
+    let filled_char = "█";
+    let empty_char = "░";
+    
+    let bar: String = (0..filled_len).map(|_| filled_char).collect::<String>() 
+                    + &(0..empty_len).map(|_| empty_char).collect::<String>();
+    
+    let percentage = (ratio * 100.0) as usize;
+    format!("{} {}% ({}/{})", bar, percentage, current, total)
+}
+
 async fn run_worker_robust(
     _worker_id: usize,
     proxy_pool: Arc<Mutex<Vec<String>>>,
@@ -264,7 +280,7 @@ async fn run_worker_robust(
     shutdown_rx: watch::Receiver<bool>,
     use_send_invite: bool,
     refill_filter: Option<ProxyFilter>,
-    cookie_store: Arc<Jar>, // مخزن کوکی مشترک
+    cookie_store: Arc<Jar>,
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -314,7 +330,6 @@ async fn run_worker_robust(
 
             if let Some(proxy_url) = pool.pop() {
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
-                    // ارسال cookie_store مشترک به کلاینت جدید
                     if let Ok(c) = build_client(&token, Some(proxy_obj), cookie_store.clone()) {
                         current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         current_proxy_addr = proxy_url;
@@ -541,11 +556,10 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
     
-    // ایجاد مخزن کوکی مشترک برای همه
     let shared_cookie_store = Arc::new(Jar::default());
 
     println!("🚀 Launching {} worker threads...", worker_count);
-    println!("📊 Statistics will update every 2 seconds...");
+    println!("\n"); 
 
     for id in 0..worker_count {
         let pool = shared_pool.clone();
@@ -554,7 +568,7 @@ async fn main() -> Result<()> {
         let s_ref = success_counter.clone();
         let f_ref = failure_counter.clone();
         let rx = shutdown_rx.clone();
-        let cookie_store_clone = shared_cookie_store.clone(); // کپی رفرنس مخزن کوکی
+        let cookie_store_clone = shared_cookie_store.clone();
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
@@ -590,19 +604,39 @@ async fn main() -> Result<()> {
     let monitor_pool = shared_pool.clone();
     let monitor_tx = shutdown_tx.clone();
     
-    // Statistics Loop
+    let mut is_first_print = true;
+    
+    // ذخیره تعداد اولیه پراکسی‌ها برای محاسبه درصد باقی‌مانده
+    let mut max_proxy_count = monitor_pool.lock().await.len();
+
     loop {
         sleep(Duration::from_secs(2)).await;
         
         let successes = *monitor_success.lock().await;
         let failures = *monitor_failure.lock().await;
         let proxies_left = monitor_pool.lock().await.len();
+        
+        // اگر پراکسی‌ها رفرش شدند، مقدار ماکزیمم را آپدیت کن تا نوار خراب نشود
+        if proxies_left > max_proxy_count {
+            max_proxy_count = proxies_left;
+        }
 
-        println!("\n---------------------------------");
-        println!("✅ Successful Requests: {}", successes);
-        println!("❌ Failed Requests:     {}", failures);
-        println!("🎱 Proxies Remaining:   {}", proxies_left);
-        println!("---------------------------------");
+        if !is_first_print {
+            print!("\x1b[5A");
+        }
+
+        // ساخت نوار پیشرفت
+        let progress_bar_str = generate_progress_bar(proxies_left, max_proxy_count);
+
+        print!("\x1b[2K"); println!("--------------------------------------------------");
+        print!("\x1b[2K"); println!(" ✅ Successful Requests: {}", successes);
+        print!("\x1b[2K"); println!(" ❌ Failed Requests:     {}", failures);
+        print!("\x1b[2K"); println!(" 🔋 Proxies Left:        {}", progress_bar_str);
+        print!("\x1b[2K"); println!("--------------------------------------------------");
+        
+        io::stdout().flush().unwrap();
+        
+        is_first_print = false;
 
         if successes >= target_count {
             let _ = monitor_tx.send(true);
