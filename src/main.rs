@@ -138,7 +138,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
         .tcp_nodelay(true)
         .cookie_store(true)
         .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(15));
+        .timeout(Duration::from_secs(10));
 
     if let Some(p) = proxy {
         builder = builder.proxy(p);
@@ -167,7 +167,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter, silent: bool) -
     let spawn_download = |url: String, proto: &'static str, client: Client| {
         tokio::spawn(async move {
             let mut found = Vec::new();
-            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(15)).send().await {
+            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(10)).send().await {
                 if let Ok(text) = resp.text().await {
                     for line in text.lines() {
                         let p = line.trim();
