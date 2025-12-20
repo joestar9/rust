@@ -45,9 +45,9 @@ enum ProxyStatus {
 }
 
 #[derive(Serialize)]
-struct InviteData {
-    application_name: String,
-    friend_number: String,
+struct InviteData<'a> {
+    application_name: &'a str,
+    friend_number: &'a str,
 }
 
 #[derive(Deserialize, Debug)]
@@ -180,8 +180,11 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_string: &str) -> Resul
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
+        .tcp_keepalive(Duration::from_secs(60))
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(10))
+        .http2_adaptive_window(true)
         .cookie_store(false)
-        .pool_idle_timeout(Duration::from_secs(90))
         .timeout(Duration::from_secs(15));
 
     if let Some(p) = proxy {
@@ -276,6 +279,7 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     let file = File::open(clean_path).context(format!("Could not open file: {}", clean_path))?;
     let reader = BufReader::new(file);
     let mut unique_set = HashSet::new();
+
     println!("📁 Processing local proxies from '{}'...", clean_path);
     
     for line in reader.lines() {
@@ -311,7 +315,6 @@ async fn run_worker_robust(
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
-
     let mut current_client: Option<(Client, Arc<AtomicBool>)> = None;
     let mut consecutive_errors: u8 = 0;
 
@@ -353,7 +356,6 @@ async fn run_worker_robust(
             }
 
             let mut pool = proxy_pool.lock().await;
-
             if let Some(proxy_url) = pool.pop() {
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj), &cookie_str) {
@@ -385,7 +387,7 @@ async fn run_worker_robust(
 
                     let current_idx = idx_ref.fetch_add(1, Ordering::Relaxed);
                     let phone = generate_unique_number(current_idx, start_offset, &p_ref);
-
+                    
                     let status = perform_invite(&client, phone, &s_ref, &f_ref, target, use_send_invite).await;
                     let _ = tx.send(status).await;
                 });
@@ -403,8 +405,11 @@ async fn perform_invite(
     use_send_invite: bool
 ) -> ProxyStatus {
     if success_counter.load(Ordering::Relaxed) >= target { return ProxyStatus::Healthy; }
-
-    let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
+    
+    let data = InviteData { 
+        application_name: "NGMI", 
+        friend_number: &phone 
+    };
 
     let res1 = client.post(API_CHECK_APP)
         .header("Referer", "https://my.irancell.ir/invite")
@@ -475,6 +480,7 @@ async fn main() -> Result<()> {
     };
 
     println!("📱 Loaded {} prefixes.", config.prefixes.len());
+
     let count_input = prompt_input("🎯 Target SUCCESS Count: ");
     let target_count: usize = count_input.parse().unwrap_or(1000);
 
@@ -571,8 +577,8 @@ async fn main() -> Result<()> {
     if raw_pool.is_empty() { return Err(anyhow!("❌ Pool is empty.")); }
 
     let shared_cookie = Arc::new(get_initial_cookie_string(&token).await.unwrap_or_default());
-
     let shared_pool = Arc::new(Mutex::new(raw_pool));
+    
     let success_counter = Arc::new(AtomicUsize::new(0));
     let failure_counter = Arc::new(AtomicUsize::new(0));
     let global_index_counter = Arc::new(AtomicUsize::new(0));
@@ -583,7 +589,6 @@ async fn main() -> Result<()> {
 
     println!("🚀 Launching {} worker threads...", worker_count);
     sleep(Duration::from_secs(1)).await;
-
     print!("\x1B[2J\x1B[1;1H");
 
     for id in 0..worker_count {
@@ -610,6 +615,7 @@ async fn main() -> Result<()> {
                         let sr = s_ref.clone();
                         let fr = f_ref.clone();
                         let ir = idx_ref.clone();
+                        
                         tokio::spawn(async move {
                             let _p = permit;
                             let current_idx = ir.fetch_add(1, Ordering::Relaxed);
@@ -633,7 +639,6 @@ async fn main() -> Result<()> {
     
     loop {
         sleep(Duration::from_secs(2)).await;
-
         let success = monitor_success.load(Ordering::Relaxed);
         let failures = monitor_failure.load(Ordering::Relaxed);
         
@@ -655,8 +660,10 @@ async fn main() -> Result<()> {
 
     println!("🏁 Target reached. Stopping...");
     sleep(Duration::from_secs(2)).await;
+
     println!("\n📊 Final Results: {} Successes, {} Failures", 
         success_counter.load(Ordering::Relaxed), 
         failure_counter.load(Ordering::Relaxed));
+    
     Ok(())
 }
