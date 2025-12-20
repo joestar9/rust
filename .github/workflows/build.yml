@@ -1,4 +1,4 @@
-name: Build Linux + Windows + Android (No Compression)
+name: Build Linux + Windows + Android
 
 on:
   push:
