@@ -67,6 +67,46 @@ struct ProxySourceConfig {
     socks5: Vec<String>,
 }
 
+struct ErrorStats {
+    proxy_errors: AtomicUsize, 
+    forbidden_bans: AtomicUsize, // 403, 429
+    unauthorized: AtomicUsize, // 401
+    not_found: AtomicUsize, // 404
+    bad_requests: AtomicUsize, // 400
+    server_errors: AtomicUsize, // 500-599
+    logic_fail: AtomicUsize, // 200 OK but message != done
+    parse_fail: AtomicUsize, // 200 OK but invalid JSON/HTML
+    others: AtomicUsize, 
+}
+
+impl ErrorStats {
+    fn new() -> Self {
+        Self {
+            proxy_errors: AtomicUsize::new(0),
+            forbidden_bans: AtomicUsize::new(0),
+            unauthorized: AtomicUsize::new(0),
+            not_found: AtomicUsize::new(0),
+            bad_requests: AtomicUsize::new(0),
+            server_errors: AtomicUsize::new(0),
+            logic_fail: AtomicUsize::new(0),
+            parse_fail: AtomicUsize::new(0),
+            others: AtomicUsize::new(0),
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.proxy_errors.load(Ordering::Relaxed) +
+        self.forbidden_bans.load(Ordering::Relaxed) +
+        self.unauthorized.load(Ordering::Relaxed) +
+        self.not_found.load(Ordering::Relaxed) +
+        self.bad_requests.load(Ordering::Relaxed) +
+        self.server_errors.load(Ordering::Relaxed) +
+        self.logic_fail.load(Ordering::Relaxed) +
+        self.parse_fail.load(Ordering::Relaxed) +
+        self.others.load(Ordering::Relaxed)
+    }
+}
+
 fn read_config() -> Result<AppConfig> {
     if !std::path::Path::new(CONFIG_FILE).exists() {
         return Err(anyhow!("❌ '{}' not found.", CONFIG_FILE));
@@ -180,7 +220,6 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_string: &str) -> Resul
         .default_headers(headers)
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(60))
-        // تنظیمات حیاتی برای نگه داشتن کانکشن‌های پراکسی سالم
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(Duration::from_secs(10))
         .cookie_store(false)
@@ -303,7 +342,7 @@ async fn run_worker_robust(
     concurrency_limit: usize,
     prefixes: Arc<Vec<String>>,
     success_counter: Arc<AtomicUsize>,
-    failure_counter: Arc<AtomicUsize>,
+    error_stats: Arc<ErrorStats>, 
     global_index_counter: Arc<AtomicUsize>,
     start_offset: usize,
     target: usize,
@@ -373,7 +412,7 @@ async fn run_worker_robust(
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
                 let s_ref = success_counter.clone();
-                let f_ref = failure_counter.clone();
+                let err_ref = error_stats.clone();
                 let idx_ref = global_index_counter.clone();
                 let tx = status_tx.clone();
                 let s_rx = shutdown_rx.clone();
@@ -387,7 +426,7 @@ async fn run_worker_robust(
                     let current_idx = idx_ref.fetch_add(1, Ordering::Relaxed);
                     let phone = generate_unique_number(current_idx, start_offset, &p_ref);
                     
-                    let status = perform_invite(&client, phone, &s_ref, &f_ref, target, use_send_invite).await;
+                    let status = perform_invite(&client, phone, &s_ref, &err_ref, target, use_send_invite).await;
                     let _ = tx.send(status).await;
                 });
             }
@@ -399,7 +438,7 @@ async fn perform_invite(
     client: &Client,
     phone: String,
     success_counter: &Arc<AtomicUsize>,
-    failure_counter: &Arc<AtomicUsize>,
+    error_stats: &Arc<ErrorStats>,
     target: usize,
     use_send_invite: bool
 ) -> ProxyStatus {
@@ -417,12 +456,9 @@ async fn perform_invite(
     match res1 {
         Ok(resp) => {
             let status_code = resp.status();
-            
-            if status_code == 403 || status_code == 429 || status_code == 407 {
-                return ProxyStatus::HardFail; 
-            }
+            let code_u16 = status_code.as_u16();
 
-            if status_code.as_u16() == 200 {
+            if status_code.is_success() { 
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                     if body["message"] == "done" {
@@ -437,33 +473,83 @@ async fn perform_invite(
 
                         match res2 {
                             Ok(resp2) => {
-                                if resp2.status().as_u16() == 200 {
+                                let code2 = resp2.status().as_u16();
+                                if code2 == 200 {
                                     let text2 = resp2.text().await.unwrap_or_default();
                                     if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
                                         if body2["message"] == "done" {
                                             success_counter.fetch_add(1, Ordering::Relaxed);
                                             return ProxyStatus::Healthy;
+                                        } else {
+                                            error_stats.logic_fail.fetch_add(1, Ordering::Relaxed);
+                                            return ProxyStatus::Healthy; 
                                         }
+                                    } else {
+                                        error_stats.parse_fail.fetch_add(1, Ordering::Relaxed);
+                                        return ProxyStatus::SoftFail;
                                     }
+                                } 
+                                if code2 == 403 || code2 == 429 || code2 == 407 {
+                                    error_stats.forbidden_bans.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::HardFail;
+                                } else if code2 == 401 {
+                                    error_stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::SoftFail;
+                                } else if code2 == 404 {
+                                    error_stats.not_found.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::SoftFail;
+                                } else if code2 >= 500 {
+                                    error_stats.server_errors.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::SoftFail;
+                                } else {
+                                    error_stats.others.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::SoftFail;
                                 }
-                                failure_counter.fetch_add(1, Ordering::Relaxed);
-                                return ProxyStatus::SoftFail;
                             },
                             Err(_) => {
-                                failure_counter.fetch_add(1, Ordering::Relaxed);
+                                error_stats.proxy_errors.fetch_add(1, Ordering::Relaxed);
                                 return ProxyStatus::HardFail;
                             }
                         }
+                    } else {
+                        error_stats.logic_fail.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::Healthy; 
+                    }
+                } else {
+                    error_stats.parse_fail.fetch_add(1, Ordering::Relaxed);
+                    return ProxyStatus::SoftFail;
+                }
+            } else {
+                match code_u16 {
+                    403 | 429 | 407 => {
+                        error_stats.forbidden_bans.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::HardFail; 
+                    },
+                    401 => {
+                        error_stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
+                    },
+                    400 => {
+                        error_stats.bad_requests.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
+                    },
+                    404 => {
+                        error_stats.not_found.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
+                    },
+                    500..=599 => {
+                        error_stats.server_errors.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
+                    },
+                    _ => {
+                        error_stats.others.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
                     }
                 }
-                return ProxyStatus::Healthy;
-            } else {
-                failure_counter.fetch_add(1, Ordering::Relaxed);
-                return ProxyStatus::SoftFail; 
             }
         },
         Err(_) => {
-            failure_counter.fetch_add(1, Ordering::Relaxed);
+            error_stats.proxy_errors.fetch_add(1, Ordering::Relaxed);
             return ProxyStatus::HardFail; 
         }
     }
@@ -579,7 +665,9 @@ async fn main() -> Result<()> {
     let shared_pool = Arc::new(Mutex::new(raw_pool));
     
     let success_counter = Arc::new(AtomicUsize::new(0));
-    let failure_counter = Arc::new(AtomicUsize::new(0));
+    
+    let error_stats = Arc::new(ErrorStats::new());
+
     let global_index_counter = Arc::new(AtomicUsize::new(0));
     let start_offset = rand::rng().random_range(0..MODULO_SPACE);
     
@@ -595,7 +683,7 @@ async fn main() -> Result<()> {
         let token_clone = token.clone();
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
-        let f_ref = failure_counter.clone();
+        let err_ref = error_stats.clone();
         let idx_ref = global_index_counter.clone();
         let rx = shutdown_rx.clone();
         let cookie_ref = shared_cookie.clone();
@@ -612,42 +700,63 @@ async fn main() -> Result<()> {
                         let c = client.clone();
                         let pr = p_ref.clone();
                         let sr = s_ref.clone();
-                        let fr = f_ref.clone();
+                        let er = err_ref.clone();
                         let ir = idx_ref.clone();
                         
                         tokio::spawn(async move {
                             let _p = permit;
                             let current_idx = ir.fetch_add(1, Ordering::Relaxed);
                             let phone = generate_unique_number(current_idx, start_offset, &pr);
-                            perform_invite(&c, phone, &sr, &fr, target_count, use_send_invite).await;
+                            perform_invite(&c, phone, &sr, &er, target_count, use_send_invite).await;
                         });
                     }
                 }
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, f_ref, idx_ref, start_offset, target_count, rx, use_send_invite, refill_filter, cookie_ref).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, err_ref, idx_ref, start_offset, target_count, rx, use_send_invite, refill_filter, cookie_ref).await;
             });
         }
     }
 
     let monitor_success = success_counter.clone();
-    let monitor_failure = failure_counter.clone();
+    let monitor_errors = error_stats.clone();
     let monitor_tx = shutdown_tx.clone();
     let start_time = Instant::now();
     
     loop {
         sleep(Duration::from_secs(2)).await;
         let success = monitor_success.load(Ordering::Relaxed);
-        let failures = monitor_failure.load(Ordering::Relaxed);
         
+        let proxy_errs = monitor_errors.proxy_errors.load(Ordering::Relaxed);
+        let bans = monitor_errors.forbidden_bans.load(Ordering::Relaxed);
+        let unauth = monitor_errors.unauthorized.load(Ordering::Relaxed);
+        let not_found = monitor_errors.not_found.load(Ordering::Relaxed);
+        let bad_reqs = monitor_errors.bad_requests.load(Ordering::Relaxed);
+        let server_errs = monitor_errors.server_errors.load(Ordering::Relaxed);
+        let logic = monitor_errors.logic_fail.load(Ordering::Relaxed);
+        let parse = monitor_errors.parse_fail.load(Ordering::Relaxed);
+        let others = monitor_errors.others.load(Ordering::Relaxed);
+        let total_fails = monitor_errors.total();
+
         print!("\x1B[2J\x1B[1;1H"); 
         
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("           🚀 IRANCELL INVITE BOT STATUS         ");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!(" ✅ Success: \x1B[32m{}\x1B[0m", success);
-        println!(" ❌ Failed:  \x1B[31m{}\x1B[0m", failures);
+        println!(" ❌ Total Failed: \x1B[31m{}\x1B[0m", total_fails);
+        println!(" -----------------------------------------------");
+        println!(" 🔌 Proxy/Net Errors:  \x1B[33m{}\x1B[0m", proxy_errs);
+        println!(" 🚫 Bans (403/429):    \x1B[35m{}\x1B[0m", bans);
+        println!(" 🔐 Unauthorized (401):\x1B[31m{}\x1B[0m", unauth);
+        println!(" 🔍 Not Found (404):   \x1B[34m{}\x1B[0m", not_found);
+        println!(" ⚠️ Bad Req (400):     \x1B[36m{}\x1B[0m", bad_reqs);
+        println!(" 🔥 Server Err (5xx):  \x1B[31m{}\x1B[0m", server_errs);
+        println!(" 🧠 Logic Fail (Msg):  \x1B[37m{}\x1B[0m", logic);
+        println!(" 📄 Parse Fail (HTML): \x1B[90m{}\x1B[0m", parse);
+        println!(" ❓ Other Errors:      {}", others);
+        println!(" -----------------------------------------------");
         println!(" ⏳ Elapsed: {:.2?}", start_time.elapsed());
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         
@@ -660,9 +769,17 @@ async fn main() -> Result<()> {
     println!("🏁 Target reached. Stopping...");
     sleep(Duration::from_secs(2)).await;
 
-    println!("\n📊 Final Results: {} Successes, {} Failures", 
-        success_counter.load(Ordering::Relaxed), 
-        failure_counter.load(Ordering::Relaxed));
+    println!("\n📊 Final Results:");
+    println!("✅ Successes: {}", success_counter.load(Ordering::Relaxed));
+    println!("🔌 Proxy Errors: {}", error_stats.proxy_errors.load(Ordering::Relaxed));
+    println!("🚫 Bans/Forbidden: {}", error_stats.forbidden_bans.load(Ordering::Relaxed));
+    println!("🔐 Unauthorized: {}", error_stats.unauthorized.load(Ordering::Relaxed));
+    println!("🔍 Not Found: {}", error_stats.not_found.load(Ordering::Relaxed));
+    println!("⚠️ Bad Requests: {}", error_stats.bad_requests.load(Ordering::Relaxed));
+    println!("🔥 Server Errors: {}", error_stats.server_errors.load(Ordering::Relaxed));
+    println!("🧠 Logic Fails: {}", error_stats.logic_fail.load(Ordering::Relaxed));
+    println!("📄 Parse Fails: {}", error_stats.parse_fail.load(Ordering::Relaxed));
+    println!("❓ Others: {}", error_stats.others.load(Ordering::Relaxed));
     
     Ok(())
 }
