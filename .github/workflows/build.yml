@@ -2,7 +2,9 @@ name: Build Linux + Windows + Android
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
+    tags:
+      - "v*"
   workflow_dispatch:
 
 env:
@@ -20,14 +22,14 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable_name: irancell_pro_invite
-            artifact_name: irancell_pro_invite_linux_x64
+            asset_base: irancell_pro_invite_linux_x64
             is_android: false
 
           - name: windows-latest / x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             executable_name: irancell_pro_invite.exe
-            artifact_name: irancell_pro_invite_windows_x64.exe
+            asset_base: irancell_pro_invite_windows_x64
             is_android: false
 
           - name: android / arm64-v8a
@@ -35,7 +37,7 @@ jobs:
             target: aarch64-linux-android
             android_abi: arm64-v8a
             executable_name: irancell_pro_invite
-            artifact_name: irancell_pro_invite_android_arm64
+            asset_base: irancell_pro_invite_android_arm64
             is_android: true
 
     steps:
@@ -69,21 +71,60 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           cargo install cargo-ndk --locked
-          echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME" 
+          echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
           cargo ndk -t ${{ matrix.android_abi }} build --release --target ${{ matrix.target }}
 
-      - name: Prepare Artifacts
+      - name: Prepare Package Content
         shell: bash
         run: |
-          mkdir -p release_pack
-          cp target/${{ matrix.target }}/release/${{ matrix.executable_name }} release_pack/${{ matrix.artifact_name }}
-          if [ -f config.json ]; then
-            cp config.json release_pack/
-          fi
+          rm -rf release_pack dist
+          mkdir -p release_pack dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable_name }}" "release_pack/${{ matrix.executable_name }}"
+          if [ -f config.json ]; then cp config.json release_pack/; fi
 
-      - name: Upload Artifact
+      # Linux -> tar.gz (پرمیژن‌ها بهتر حفظ میشه)
+      - name: Package (Linux)
+        if: ${{ runner.os == 'Linux' && !matrix.is_android }}
+        shell: bash
+        run: |
+          tar -czf "dist/${{ matrix.asset_base }}.tar.gz" -C release_pack .
+
+      # Android -> zip
+      - name: Package (Android)
+        if: ${{ matrix.is_android }}
+        shell: bash
+        run: |
+          (cd release_pack && zip -r "../dist/${{ matrix.asset_base }}.zip" .)
+
+      # Windows -> zip
+      - name: Package (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "release_pack\*" -DestinationPath ("dist\" + "${{ matrix.asset_base }}" + ".zip") -Force
+
+      - name: Upload Artifact (for workflow run)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: release_pack/*
+          name: ${{ matrix.asset_base }}
+          path: dist/*
           if-no-files-found: error
+
+  release:
+    name: Upload assets to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
