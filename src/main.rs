@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
-use reqwest::cookie::Jar; // استفاده از سیستم کوکی دستی
+use reqwest::cookie::Jar;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -124,7 +124,6 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     clean
 }
 
-// تابع ساخت کلاینت که حالا Jar اشتراکی را می‌گیرد
 fn build_client(token: &str, proxy: Option<Proxy>, cookie_jar: Arc<Jar>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
@@ -138,7 +137,7 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_jar: Arc<Jar>) -> Resu
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
-        .cookie_provider(cookie_jar) // استفاده از کوکی اشتراکی
+        .cookie_provider(cookie_jar)
         .pool_idle_timeout(Duration::from_secs(90))
         .timeout(Duration::from_secs(15));
 
@@ -149,16 +148,10 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_jar: Arc<Jar>) -> Resu
     builder.build().context("Failed to build client")
 }
 
-// تابع برای دریافت کوکی اولیه (فقط یک بار اجرا می‌شود)
 async fn initialize_shared_cookies(token: &str, jar: Arc<Jar>) -> Result<()> {
     println!("🍪 Initializing shared session cookies...");
-    // یک کلاینت موقت بدون پراکسی (یا با پراکسی سیستم) می‌سازیم تا کوکی را بگیرد
     let client = build_client(token, None, jar)?;
-    
-    // یک درخواست سبک می‌فرستیم تا سرور کوکی‌ها را ست کند
-    // حتی اگر خطا بدهد، هدرهای کوکی معمولا ست می‌شوند
     let _ = client.get(API_CHECK_APP).send().await;
-    
     println!("✅ Cookies acquired and shared.");
     Ok(())
 }
@@ -277,7 +270,7 @@ async fn run_worker_robust(
     shutdown_rx: watch::Receiver<bool>,
     use_send_invite: bool,
     refill_filter: Option<ProxyFilter>,
-    shared_jar: Arc<Jar> // دریافت کوکی اشتراکی
+    shared_jar: Arc<Jar>
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -327,7 +320,6 @@ async fn run_worker_robust(
 
             if let Some(proxy_url) = pool.pop() {
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
-                    // اینجا shared_jar را پاس میدهیم
                     if let Ok(c) = build_client(&token, Some(proxy_obj), shared_jar.clone()) {
                         current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         current_proxy_addr = proxy_url;
@@ -548,13 +540,10 @@ async fn main() -> Result<()> {
 
     if raw_pool.is_empty() { return Err(anyhow!("❌ Pool is empty.")); }
 
-    // ساخت Jar اشتراکی برای کوکی
     let shared_jar = Arc::new(Jar::default());
     
-    // گرفتن کوکی اولیه
     if let Err(e) = initialize_shared_cookies(&token, shared_jar.clone()).await {
         println!("⚠️ Warning: Could not initialize cookies: {}", e);
-        // ادامه می‌دهیم، شاید در طول اجرا ست شوند
     }
 
     let shared_pool = Arc::new(Mutex::new(raw_pool));
@@ -575,7 +564,7 @@ async fn main() -> Result<()> {
         let s_ref = success_counter.clone();
         let f_ref = failure_counter.clone();
         let rx = shutdown_rx.clone();
-        let jar_ref = shared_jar.clone(); // پاس دادن کوکی اشتراکی
+        let jar_ref = shared_jar.clone(); 
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
@@ -617,7 +606,6 @@ async fn main() -> Result<()> {
         let success = *monitor_success.lock().await;
         let failures = *monitor_failure.lock().await;
         
-        // پاک کردن صفحه
         print!("\x1B[2J\x1B[1;1H"); 
         
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -628,8 +616,6 @@ async fn main() -> Result<()> {
         println!(" ⏳ Elapsed: {:.2?}", start_time.elapsed());
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         
-        // بخش مربوط به تعداد پراکسی و پراگرس بار کاملا حذف شد
-
         if success >= target_count {
             let _ = monitor_tx.send(true);
             break;
