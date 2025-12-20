@@ -1,7 +1,17 @@
+در این نسخه تغییرات زیر اعمال شد:
+
+1.  **حذف آمار پراکسی‌ها:** بخش مربوط به نمایش «تعداد پراکسی‌های مانده» و «پراگرس بار» از داشبورد حذف شد و فقط آمار موفق/ناموفق و زمان نمایش داده می‌شود.
+2.  **سیستم کوکی اشتراکی (Shared Cookie Jar):**
+    *   یک `Jar` (ظرف کوکی) مشترک ساخته می‌شود.
+    *   قبل از شروع ورکرها، یک درخواست اولیه (Pre-warm) ارسال می‌شود تا کوکی‌های لازم دریافت و در این ظرف ذخیره شوند.
+    *   این ظرف کوکی (`Arc<Jar>`) به تمام ورکرها پاس داده می‌شود. بنابراین وقتی ورکرها کلاینت جدید می‌سازند (حتی با تغییر پراکسی)، از همان کوکی‌های دریافت شده‌ی اولیه استفاده می‌کنند و درخواست کوکی مجدد نمی‌فرستند.
+
+```rust
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
+use reqwest::cookie::Jar; // استفاده از سیستم کوکی دستی
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -123,7 +133,8 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     clean
 }
 
-fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
+// تابع ساخت کلاینت که حالا Jar اشتراکی را می‌گیرد
+fn build_client(token: &str, proxy: Option<Proxy>, cookie_jar: Arc<Jar>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
@@ -136,15 +147,29 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
-        .cookie_store(true)
+        .cookie_provider(cookie_jar) // استفاده از کوکی اشتراکی
         .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(10));
+        .timeout(Duration::from_secs(15));
 
     if let Some(p) = proxy {
         builder = builder.proxy(p);
     }
 
     builder.build().context("Failed to build client")
+}
+
+// تابع برای دریافت کوکی اولیه (فقط یک بار اجرا می‌شود)
+async fn initialize_shared_cookies(token: &str, jar: Arc<Jar>) -> Result<()> {
+    println!("🍪 Initializing shared session cookies...");
+    // یک کلاینت موقت بدون پراکسی (یا با پراکسی سیستم) می‌سازیم تا کوکی را بگیرد
+    let client = build_client(token, None, jar)?;
+    
+    // یک درخواست سبک می‌فرستیم تا سرور کوکی‌ها را ست کند
+    // حتی اگر خطا بدهد، هدرهای کوکی معمولا ست می‌شوند
+    let _ = client.get(API_CHECK_APP).send().await;
+    
+    println!("✅ Cookies acquired and shared.");
+    Ok(())
 }
 
 async fn fetch_proxies_list(_token: String, filter: ProxyFilter, silent: bool) -> Result<Vec<String>> {
@@ -167,7 +192,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter, silent: bool) -
     let spawn_download = |url: String, proto: &'static str, client: Client| {
         tokio::spawn(async move {
             let mut found = Vec::new();
-            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(10)).send().await {
+            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(15)).send().await {
                 if let Ok(text) = resp.text().await {
                     for line in text.lines() {
                         let p = line.trim();
@@ -260,7 +285,8 @@ async fn run_worker_robust(
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
     use_send_invite: bool,
-    refill_filter: Option<ProxyFilter>
+    refill_filter: Option<ProxyFilter>,
+    shared_jar: Arc<Jar> // دریافت کوکی اشتراکی
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -310,7 +336,8 @@ async fn run_worker_robust(
 
             if let Some(proxy_url) = pool.pop() {
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
-                    if let Ok(c) = build_client(&token, Some(proxy_obj)) {
+                    // اینجا shared_jar را پاس میدهیم
+                    if let Ok(c) = build_client(&token, Some(proxy_obj), shared_jar.clone()) {
                         current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         current_proxy_addr = proxy_url;
                         consecutive_errors = 0;
@@ -530,7 +557,15 @@ async fn main() -> Result<()> {
 
     if raw_pool.is_empty() { return Err(anyhow!("❌ Pool is empty.")); }
 
-    let initial_proxy_count = raw_pool.len();
+    // ساخت Jar اشتراکی برای کوکی
+    let shared_jar = Arc::new(Jar::default());
+    
+    // گرفتن کوکی اولیه
+    if let Err(e) = initialize_shared_cookies(&token, shared_jar.clone()).await {
+        println!("⚠️ Warning: Could not initialize cookies: {}", e);
+        // ادامه می‌دهیم، شاید در طول اجرا ست شوند
+    }
+
     let shared_pool = Arc::new(Mutex::new(raw_pool));
     let success_counter = Arc::new(Mutex::new(0));
     let failure_counter = Arc::new(Mutex::new(0));
@@ -540,7 +575,6 @@ async fn main() -> Result<()> {
     println!("🚀 Launching {} worker threads...", worker_count);
     sleep(Duration::from_secs(1)).await;
 
-    // Clear screen before starting loop
     print!("\x1B[2J\x1B[1;1H");
 
     for id in 0..worker_count {
@@ -550,11 +584,12 @@ async fn main() -> Result<()> {
         let s_ref = success_counter.clone();
         let f_ref = failure_counter.clone();
         let rx = shutdown_rx.clone();
+        let jar_ref = shared_jar.clone(); // پاس دادن کوکی اشتراکی
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
         if mode == RunMode::Direct {
-            let client = build_client(&token_clone, None)?;
+            let client = build_client(&token_clone, None, jar_ref)?;
             tokio::spawn(async move {
                 let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
@@ -575,7 +610,7 @@ async fn main() -> Result<()> {
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, f_ref, target_count, rx, use_send_invite, refill_filter).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, f_ref, target_count, rx, use_send_invite, refill_filter, jar_ref).await;
             });
         }
     }
@@ -583,7 +618,6 @@ async fn main() -> Result<()> {
     let monitor_success = success_counter.clone();
     let monitor_failure = failure_counter.clone();
     let monitor_tx = shutdown_tx.clone();
-    let monitor_pool = shared_pool.clone();
     let start_time = Instant::now();
     
     loop {
@@ -591,9 +625,7 @@ async fn main() -> Result<()> {
 
         let success = *monitor_success.lock().await;
         let failures = *monitor_failure.lock().await;
-        let pool_size = monitor_pool.lock().await.len();
         
-        // ANSI Escape to Clear Screen and Reset Cursor
         print!("\x1B[2J\x1B[1;1H"); 
         
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -604,18 +636,6 @@ async fn main() -> Result<()> {
         println!(" ⏳ Elapsed: {:.2?}", start_time.elapsed());
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         
-        let total = if initial_proxy_count > 0 { initial_proxy_count } else { 1 };
-        // In AutoProxy mode, pool_size can exceed initial.
-        let effective_total = if pool_size > total { pool_size } else { total };
-        let percent = (pool_size as f64 / effective_total as f64 * 100.0).max(0.0).min(100.0);
-        let bar_len = 30;
-        let filled = (bar_len as f64 * percent / 100.0) as usize;
-        let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-        
-        println!(" 🛡️  Proxies Left: {} / {}", pool_size, effective_total);
-        println!(" [{}] {:.1}%", bar, percent);
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
         if success >= target_count {
             let _ = monitor_tx.send(true);
             break;
@@ -627,3 +647,4 @@ async fn main() -> Result<()> {
     println!("\n📊 Final Results: {} Successes, {} Failures", *success_counter.lock().await, *failure_counter.lock().await);
     Ok(())
 }
+```
