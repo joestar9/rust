@@ -1,11 +1,10 @@
 use anyhow::{Context, Result, anyhow};
-use chrono::Local;
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
+use reqwest::cookie::Jar; // اضافه شد
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::fs::OpenOptions;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
@@ -15,7 +14,6 @@ use tokio::sync::{mpsc, Mutex, Semaphore, watch};
 use tokio::time::sleep;
 
 const CONFIG_FILE: &str = "config.json";
-const LOG_FILE: &str = "debug.log";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.json";
@@ -53,7 +51,8 @@ struct InviteData {
 struct AppConfig {
     token: Option<String>,
     prefixes: Vec<String>,
-    debug: Option<bool>,
+    #[serde(skip)]
+    _debug: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -93,13 +92,6 @@ fn prompt_input(prompt: &str) -> String {
     buffer.trim().to_string()
 }
 
-async fn log_debug(msg: String) {
-    let timestamp = Local::now().format("%H:%M:%S");
-    let log_line = format!("[{}] {}\n", timestamp, msg);
-    let result = OpenOptions::new().create(true).append(true).open(LOG_FILE);
-    if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
-}
-
 fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     let mut clean = raw.trim().to_string();
     
@@ -133,7 +125,8 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     clean
 }
 
-fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
+// تغییر: اضافه کردن آرگومان cookie_store به سازنده کلاینت
+fn build_client(token: &str, proxy: Option<Proxy>, cookie_store: Arc<Jar>) -> Result<Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
@@ -146,7 +139,7 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
-        .cookie_store(true)
+        .cookie_provider(cookie_store) // تغییر: استفاده از مخزن کوکی اشتراکی
         .pool_idle_timeout(Duration::from_secs(90))
         .timeout(Duration::from_secs(15));
 
@@ -260,17 +253,18 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
 }
 
 async fn run_worker_robust(
-    worker_id: usize,
+    _worker_id: usize,
     proxy_pool: Arc<Mutex<Vec<String>>>,
     token: String,
     concurrency_limit: usize,
     prefixes: Arc<Vec<String>>,
     success_counter: Arc<Mutex<usize>>,
+    failure_counter: Arc<Mutex<usize>>,
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
-    debug_mode: bool,
     use_send_invite: bool,
-    refill_filter: Option<ProxyFilter>
+    refill_filter: Option<ProxyFilter>,
+    cookie_store: Arc<Jar>, // مخزن کوکی مشترک
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -294,9 +288,6 @@ async fn run_worker_robust(
         }
 
         if consecutive_errors >= MAX_RETRIES_BEFORE_SWITCH {
-            if debug_mode { 
-                log_debug(format!("♻️ Worker {} switching. Failed: {}", worker_id, current_proxy_addr)).await; 
-            }
             if let Some((_, active_flag)) = &current_client {
                 active_flag.store(false, Ordering::Relaxed);
             }
@@ -323,7 +314,8 @@ async fn run_worker_robust(
 
             if let Some(proxy_url) = pool.pop() {
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
-                    if let Ok(c) = build_client(&token, Some(proxy_obj)) {
+                    // ارسال cookie_store مشترک به کلاینت جدید
+                    if let Ok(c) = build_client(&token, Some(proxy_obj), cookie_store.clone()) {
                         current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         current_proxy_addr = proxy_url;
                         consecutive_errors = 0;
@@ -340,6 +332,7 @@ async fn run_worker_robust(
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
                 let s_ref = success_counter.clone();
+                let f_ref = failure_counter.clone();
                 let p_addr = current_proxy_addr.clone();
                 let tx = status_tx.clone();
                 let s_rx = shutdown_rx.clone();
@@ -353,7 +346,7 @@ async fn run_worker_robust(
                     let prefix = p_ref.choose(&mut rand::rng()).unwrap();
                     let phone = format!("98{}{}", prefix, generate_random_suffix());
 
-                    let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target, use_send_invite).await;
+                    let status = perform_invite(&p_addr, &client, phone, &s_ref, &f_ref, target, use_send_invite).await;
                     let _ = tx.send(status).await;
                 });
             }
@@ -362,12 +355,11 @@ async fn run_worker_robust(
 }
 
 async fn perform_invite(
-    id: usize,
-    proxy_name: &str,
+    _proxy_name: &str,
     client: &Client,
     phone: String,
     success_counter: &Arc<Mutex<usize>>,
-    debug_mode: bool,
+    failure_counter: &Arc<Mutex<usize>>,
     target: usize,
     use_send_invite: bool
 ) -> ProxyStatus {
@@ -384,6 +376,7 @@ async fn perform_invite(
             let status_code = resp.status();
             
             if status_code == 403 || status_code == 429 || status_code == 407 {
+                *failure_counter.lock().await += 1;
                 return ProxyStatus::HardFail; 
             }
 
@@ -394,7 +387,6 @@ async fn perform_invite(
                         if !use_send_invite {
                             let mut lock = success_counter.lock().await;
                             *lock += 1;
-                            println!("✅ Worker #{} | Proxy {} | App Checked: {} ({}/{})", id, proxy_name, phone, *lock, target);
                             return ProxyStatus::Healthy;
                         }
                         
@@ -410,27 +402,29 @@ async fn perform_invite(
                                         if body2["message"] == "done" {
                                             let mut lock = success_counter.lock().await;
                                             *lock += 1;
-                                            println!("✅ Worker #{} | Proxy {} | Sent: {} ({}/{})", id, proxy_name, phone, *lock, target);
                                             return ProxyStatus::Healthy;
                                         }
                                     }
                                 }
+                                *failure_counter.lock().await += 1;
                                 return ProxyStatus::SoftFail;
                             },
                             Err(_) => {
+                                *failure_counter.lock().await += 1;
                                 return ProxyStatus::HardFail;
                             }
                         }
                     }
                 }
-                return ProxyStatus::Healthy;
+                *failure_counter.lock().await += 1; 
+                return ProxyStatus::Healthy; 
             } else {
-                if debug_mode { log_debug(format!("Worker {} HTTP {} on {}", id, status_code, phone)).await; }
+                *failure_counter.lock().await += 1;
                 return ProxyStatus::SoftFail; 
             }
         },
-        Err(e) => {
-            if debug_mode { log_debug(format!("Worker {} Net Error: {}", id, e)).await; }
+        Err(_) => {
+            *failure_counter.lock().await += 1;
             return ProxyStatus::HardFail; 
         }
     }
@@ -439,11 +433,6 @@ async fn perform_invite(
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = read_config()?;
-    let debug_mode = config.debug.unwrap_or(false);
-    if debug_mode {
-        println!("🐞 Debug Mode ON.");
-        log_debug("--- SESSION STARTED ---".to_string()).await;
-    }
 
     let token = match config.token {
         Some(t) if !t.trim().is_empty() => t,
@@ -548,22 +537,29 @@ async fn main() -> Result<()> {
 
     let shared_pool = Arc::new(Mutex::new(raw_pool));
     let success_counter = Arc::new(Mutex::new(0));
+    let failure_counter = Arc::new(Mutex::new(0));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
+    
+    // ایجاد مخزن کوکی مشترک برای همه
+    let shared_cookie_store = Arc::new(Jar::default());
 
     println!("🚀 Launching {} worker threads...", worker_count);
+    println!("📊 Statistics will update every 2 seconds...");
 
     for id in 0..worker_count {
         let pool = shared_pool.clone();
         let token_clone = token.clone();
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
+        let f_ref = failure_counter.clone();
         let rx = shutdown_rx.clone();
+        let cookie_store_clone = shared_cookie_store.clone(); // کپی رفرنس مخزن کوکی
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
         if mode == RunMode::Direct {
-            let client = build_client(&token_clone, None)?;
+            let client = build_client(&token_clone, None, cookie_store_clone)?;
             tokio::spawn(async move {
                 let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
@@ -572,28 +568,43 @@ async fn main() -> Result<()> {
                         let c = client.clone();
                         let pr = p_ref.clone();
                         let sr = s_ref.clone();
+                        let fr = f_ref.clone();
                         tokio::spawn(async move {
                             let _p = permit;
                             let prefix = pr.choose(&mut rand::rng()).unwrap();
                             let phone = format!("98{}{}", prefix, generate_random_suffix());
-                            perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count, use_send_invite).await;
+                            perform_invite("DIRECT", &c, phone, &sr, &fr, target_count, use_send_invite).await;
                         });
                     }
                 }
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite, refill_filter).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, f_ref, target_count, rx, use_send_invite, refill_filter, cookie_store_clone).await;
             });
         }
     }
 
     let monitor_success = success_counter.clone();
+    let monitor_failure = failure_counter.clone();
+    let monitor_pool = shared_pool.clone();
     let monitor_tx = shutdown_tx.clone();
     
+    // Statistics Loop
     loop {
-        sleep(Duration::from_secs(1)).await;
-        if *monitor_success.lock().await >= target_count {
+        sleep(Duration::from_secs(2)).await;
+        
+        let successes = *monitor_success.lock().await;
+        let failures = *monitor_failure.lock().await;
+        let proxies_left = monitor_pool.lock().await.len();
+
+        println!("\n---------------------------------");
+        println!("✅ Successful Requests: {}", successes);
+        println!("❌ Failed Requests:     {}", failures);
+        println!("🎱 Proxies Remaining:   {}", proxies_left);
+        println!("---------------------------------");
+
+        if successes >= target_count {
             let _ = monitor_tx.send(true);
             break;
         }
@@ -601,6 +612,6 @@ async fn main() -> Result<()> {
 
     println!("🏁 Target reached. Stopping...");
     sleep(Duration::from_secs(2)).await;
-    println!("\n📊 Final Results: {} Successes", *success_counter.lock().await);
+    println!("\n📊 Final Results: {} Successes, {} Failures", *success_counter.lock().await, *failure_counter.lock().await);
     Ok(())
 }
