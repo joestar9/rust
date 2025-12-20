@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -262,23 +261,6 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     Ok(proxies)
 }
 
-fn check_tcp_connectivity(proxy_url: &str) -> bool {
-    let address_part = if let Some(idx) = proxy_url.find("://") {
-        &proxy_url[idx + 3..]
-    } else {
-        proxy_url
-    };
-
-    if let Ok(addrs) = address_part.to_socket_addrs() {
-        for addr in addrs {
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 async fn run_worker_robust(
     worker_id: usize,
     proxy_pool: Arc<Mutex<Vec<String>>>,
@@ -344,10 +326,6 @@ async fn run_worker_robust(
 
             if let Some(proxy_url) = pool.pop() {
                 drop(pool); 
-                
-                if !check_tcp_connectivity(&proxy_url) {
-                    continue; 
-                }
 
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj), shared_jar.clone()) {
@@ -577,7 +555,7 @@ async fn main() -> Result<()> {
     let success_counter = Arc::new(Mutex::new(0));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
-
+    
     let global_cookie_jar = Arc::new(Jar::default());
 
     println!("🚀 Launching {} worker threads...", worker_count);
@@ -588,12 +566,12 @@ async fn main() -> Result<()> {
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
         let rx = shutdown_rx.clone();
-        let jar_ref = global_cookie_jar.clone();
+        let jar_ref = global_cookie_jar.clone(); 
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
         if mode == RunMode::Direct {
-            let client = build_client(&token_clone, None, jar_ref)?;
+            let client = build_client(&token_clone, None, jar_ref)?; 
             tokio::spawn(async move {
                 let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
