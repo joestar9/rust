@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering}; // استفاده از Atomic
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Semaphore, watch};
 use tokio::time::sleep;
@@ -19,6 +19,9 @@ const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.json";
 const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
+
+// تعریف کاراکترها به صورت ثابت برای جلوگیری از Allocation در هر درخواست
+const DIGITS: &[u8] = b"0123456789";
 
 #[derive(Clone, Copy, PartialEq)]
 enum RunMode {
@@ -77,10 +80,15 @@ fn read_config() -> Result<AppConfig> {
     Ok(config)
 }
 
+// نسخه بسیار سریع‌تر تولید شماره بدون فشار به رم
 fn generate_random_suffix() -> String {
-    let chars: Vec<char> = "1234567890".chars().collect();
-    let mut rng = rand::rng(); 
-    (0..7).map(|_| *chars.choose(&mut rng).unwrap()).collect()
+    let mut rng = rand::rng();
+    let mut result = String::with_capacity(7);
+    for _ in 0..7 {
+        let idx = rng.random_range(0..DIGITS.len());
+        result.push(DIGITS[idx] as char);
+    }
+    result
 }
 
 fn prompt_input(prompt: &str) -> String {
@@ -264,8 +272,8 @@ async fn run_worker_robust(
     token: String,
     concurrency_limit: usize,
     prefixes: Arc<Vec<String>>,
-    success_counter: Arc<Mutex<usize>>,
-    failure_counter: Arc<Mutex<usize>>,
+    success_counter: Arc<AtomicUsize>, // تغییر به Atomic
+    failure_counter: Arc<AtomicUsize>, // تغییر به Atomic
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
     use_send_invite: bool,
@@ -276,7 +284,6 @@ async fn run_worker_robust(
     let sem = Arc::new(Semaphore::new(concurrency_limit));
 
     let mut current_client: Option<(Client, Arc<AtomicBool>)> = None;
-    let mut current_proxy_addr: String = String::new();
     let mut consecutive_errors: u8 = 0;
 
     loop {
@@ -322,7 +329,6 @@ async fn run_worker_robust(
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj), shared_jar.clone()) {
                         current_client = Some((c, Arc::new(AtomicBool::new(true))));
-                        current_proxy_addr = proxy_url;
                         consecutive_errors = 0;
                     }
                 }
@@ -334,6 +340,7 @@ async fn run_worker_robust(
         }
 
         if let Some((client, active_flag)) = current_client.clone() {
+            // استفاده از acquire_owned منتظر می‌ماند، بنابراین نیازی به sleep اضافه نیست
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
                 let s_ref = success_counter.clone();
@@ -361,12 +368,13 @@ async fn run_worker_robust(
 async fn perform_invite(
     client: &Client,
     phone: String,
-    success_counter: &Arc<Mutex<usize>>,
-    failure_counter: &Arc<Mutex<usize>>,
+    success_counter: &Arc<AtomicUsize>, // تغییر نوع ورودی
+    failure_counter: &Arc<AtomicUsize>, // تغییر نوع ورودی
     target: usize,
     use_send_invite: bool
 ) -> ProxyStatus {
-    if *success_counter.lock().await >= target { return ProxyStatus::Healthy; }
+    // خواندن Atomic بدون قفل
+    if success_counter.load(Ordering::Relaxed) >= target { return ProxyStatus::Healthy; }
 
     let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
 
@@ -387,8 +395,7 @@ async fn perform_invite(
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                     if body["message"] == "done" {
                         if !use_send_invite {
-                            let mut lock = success_counter.lock().await;
-                            *lock += 1;
+                            success_counter.fetch_add(1, Ordering::Relaxed); // افزایش اتمیک
                             return ProxyStatus::Healthy;
                         }
                         
@@ -402,19 +409,16 @@ async fn perform_invite(
                                     let text2 = resp2.text().await.unwrap_or_default();
                                     if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
                                         if body2["message"] == "done" {
-                                            let mut lock = success_counter.lock().await;
-                                            *lock += 1;
+                                            success_counter.fetch_add(1, Ordering::Relaxed); // افزایش اتمیک
                                             return ProxyStatus::Healthy;
                                         }
                                     }
                                 }
-                                let mut f_lock = failure_counter.lock().await;
-                                *f_lock += 1;
+                                failure_counter.fetch_add(1, Ordering::Relaxed);
                                 return ProxyStatus::SoftFail;
                             },
                             Err(_) => {
-                                let mut f_lock = failure_counter.lock().await;
-                                *f_lock += 1;
+                                failure_counter.fetch_add(1, Ordering::Relaxed);
                                 return ProxyStatus::HardFail;
                             }
                         }
@@ -422,14 +426,12 @@ async fn perform_invite(
                 }
                 return ProxyStatus::Healthy;
             } else {
-                let mut f_lock = failure_counter.lock().await;
-                *f_lock += 1;
+                failure_counter.fetch_add(1, Ordering::Relaxed);
                 return ProxyStatus::SoftFail; 
             }
         },
         Err(_) => {
-            let mut f_lock = failure_counter.lock().await;
-            *f_lock += 1;
+            failure_counter.fetch_add(1, Ordering::Relaxed);
             return ProxyStatus::HardFail; 
         }
     }
@@ -547,8 +549,10 @@ async fn main() -> Result<()> {
     }
 
     let shared_pool = Arc::new(Mutex::new(raw_pool));
-    let success_counter = Arc::new(Mutex::new(0));
-    let failure_counter = Arc::new(Mutex::new(0));
+    // استفاده از Atomic برای پرفورمنس بالا
+    let success_counter = Arc::new(AtomicUsize::new(0));
+    let failure_counter = Arc::new(AtomicUsize::new(0));
+    
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
 
@@ -603,8 +607,8 @@ async fn main() -> Result<()> {
     loop {
         sleep(Duration::from_secs(2)).await;
 
-        let success = *monitor_success.lock().await;
-        let failures = *monitor_failure.lock().await;
+        let success = monitor_success.load(Ordering::Relaxed);
+        let failures = monitor_failure.load(Ordering::Relaxed);
         
         print!("\x1B[2J\x1B[1;1H"); 
         
@@ -624,6 +628,8 @@ async fn main() -> Result<()> {
 
     println!("🏁 Target reached. Stopping...");
     sleep(Duration::from_secs(2)).await;
-    println!("\n📊 Final Results: {} Successes, {} Failures", *success_counter.lock().await, *failure_counter.lock().await);
+    println!("\n📊 Final Results: {} Successes, {} Failures", 
+        success_counter.load(Ordering::Relaxed), 
+        failure_counter.load(Ordering::Relaxed));
     Ok(())
 }
