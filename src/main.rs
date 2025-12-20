@@ -1,12 +1,3 @@
-در این نسخه تغییرات زیر اعمال شد:
-
-1.  **حذف آمار پراکسی‌ها:** بخش مربوط به نمایش «تعداد پراکسی‌های مانده» و «پراگرس بار» از داشبورد حذف شد و فقط آمار موفق/ناموفق و زمان نمایش داده می‌شود.
-2.  **سیستم کوکی اشتراکی (Shared Cookie Jar):**
-    *   یک `Jar` (ظرف کوکی) مشترک ساخته می‌شود.
-    *   قبل از شروع ورکرها، یک درخواست اولیه (Pre-warm) ارسال می‌شود تا کوکی‌های لازم دریافت و در این ظرف ذخیره شوند.
-    *   این ظرف کوکی (`Arc<Jar>`) به تمام ورکرها پاس داده می‌شود. بنابراین وقتی ورکرها کلاینت جدید می‌سازند (حتی با تغییر پراکسی)، از همان کوکی‌های دریافت شده‌ی اولیه استفاده می‌کنند و درخواست کوکی مجدد نمی‌فرستند.
-
-```rust
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use rand::prelude::*;
@@ -626,6 +617,7 @@ async fn main() -> Result<()> {
         let success = *monitor_success.lock().await;
         let failures = *monitor_failure.lock().await;
         
+        // پاک کردن صفحه
         print!("\x1B[2J\x1B[1;1H"); 
         
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -636,6 +628,8 @@ async fn main() -> Result<()> {
         println!(" ⏳ Elapsed: {:.2?}", start_time.elapsed());
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         
+        // بخش مربوط به تعداد پراکسی و پراگرس بار کاملا حذف شد
+
         if success >= target_count {
             let _ = monitor_tx.send(true);
             break;
@@ -647,4 +641,3 @@ async fn main() -> Result<()> {
     println!("\n📊 Final Results: {} Successes, {} Failures", *success_counter.lock().await, *failure_counter.lock().await);
     Ok(())
 }
-```
