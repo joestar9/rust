@@ -3,8 +3,6 @@ name: Build Linux + Windows + Android
 on:
   push:
     branches: ["main", "master"]
-    tags:
-      - "v*"
   workflow_dispatch:
 
 env:
@@ -82,21 +80,18 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.executable_name }}" "release_pack/${{ matrix.executable_name }}"
           if [ -f config.json ]; then cp config.json release_pack/; fi
 
-      # Linux -> tar.gz (پرمیژن‌ها بهتر حفظ میشه)
       - name: Package (Linux)
         if: ${{ runner.os == 'Linux' && !matrix.is_android }}
         shell: bash
         run: |
           tar -czf "dist/${{ matrix.asset_base }}.tar.gz" -C release_pack .
 
-      # Android -> zip
       - name: Package (Android)
         if: ${{ matrix.is_android }}
         shell: bash
         run: |
           (cd release_pack && zip -r "../dist/${{ matrix.asset_base }}.zip" .)
 
-      # Windows -> zip
       - name: Package (Windows)
         if: ${{ runner.os == 'Windows' }}
         shell: pwsh
@@ -111,9 +106,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  release:
-    name: Upload assets to GitHub Release
-    if: startsWith(github.ref, 'refs/tags/')
+  release_latest:
+    name: Publish/Update "latest" release
     needs: [build]
     runs-on: ubuntu-latest
     permissions:
@@ -124,7 +118,12 @@ jobs:
         with:
           path: dist
 
-      - name: Publish to Release
+      # این مرحله release ثابت "latest" رو می‌سازه/آپدیت می‌کنه و فایل‌ها رو attach می‌کنه
+      - name: Publish to latest release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: latest
+          name: latest
+          draft: false
+          prerelease: true
           files: dist/**/*
