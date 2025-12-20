@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow};
-use chrono::Local;
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
@@ -181,9 +180,9 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_string: &str) -> Resul
         .default_headers(headers)
         .tcp_nodelay(true)
         .tcp_keepalive(Duration::from_secs(60))
+        // تنظیمات حیاتی برای نگه داشتن کانکشن‌های پراکسی سالم
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(Duration::from_secs(10))
-        .http2_adaptive_window(true)
         .cookie_store(false)
         .timeout(Duration::from_secs(15));
 
