@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
-use reqwest::cookie::Jar;
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -19,7 +19,6 @@ const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.json";
 const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
-
 const PRIME_MULTIPLIER: usize = 6_786_793; 
 const MODULO_SPACE: usize = 10_000_000;
 
@@ -80,25 +79,12 @@ fn read_config() -> Result<AppConfig> {
     Ok(config)
 }
 
-// تابع جدید: تولید شماره یونیک بر اساس ایندکس اتمیک
 fn generate_unique_number(global_index: usize, start_offset: usize, prefixes: &[String]) -> String {
-    // 1. انتخاب پیش‌شماره بر اساس نوبت (Round Robin)
     let prefix_idx = global_index % prefixes.len();
     let prefix = &prefixes[prefix_idx];
-
-    // 2. محاسبه سید برای سافیکس (بخش ۷ رقمی)
-    // تقسیم بر تعداد پیش‌شماره‌ها باعث می‌شود برای هر پیش‌شماره شمارنده جداگانه‌ای داشته باشیم
     let sequence_num = global_index / prefixes.len();
-
-    // 3. اعمال آفست تصادفی اولیه (برای اینکه هر بار اجرا شماره‌های متفاوتی بدهد)
     let effective_index = sequence_num + start_offset;
-
-    // 4. تبدیل خطی به تصادفی-یونیک (Modular Multiplication)
-    // فرمول: (Index * LargePrime) % 10,000,000
-    // این ریاضیات تضمین می‌کند هیچ تکراری رخ ندهد.
     let unique_suffix_val = (effective_index * PRIME_MULTIPLIER) % MODULO_SPACE;
-
-    // 5. فرمت‌دهی به صورت ۷ رقم با صفر اول (مثلا 0123456)
     format!("98{}{:07}", prefix, unique_suffix_val)
 }
 
@@ -143,20 +129,58 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     clean
 }
 
-fn build_client(token: &str, proxy: Option<Proxy>, cookie_jar: Arc<Jar>) -> Result<Client> {
-    let mut headers = reqwest::header::HeaderMap::new();
+async fn get_initial_cookie_string(token: &str) -> Result<String> {
+    println!("🍪 Fetching initial cookies...");
+    
+    let mut headers = HeaderMap::new();
+    headers.insert("Authorization", HeaderValue::from_str(token)?);
+    headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
+    
+    let client = Client::builder()
+        .default_headers(headers)
+        .cookie_store(true) 
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let resp = client.get(API_CHECK_APP).send().await?;
+    
+    let cookies: Vec<String> = resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap_or("").split(';').next().unwrap_or("").to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if cookies.is_empty() {
+        println!("⚠️ No cookies received from server. Proceeding without cookies.");
+        return Ok(String::new());
+    }
+
+    let cookie_string = cookies.join("; ");
+    println!("✅ Cookies acquired: {}", cookie_string);
+    Ok(cookie_string)
+}
+
+fn build_client(token: &str, proxy: Option<Proxy>, cookie_string: &str) -> Result<Client> {
+    let mut headers = HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
     headers.insert("Accept-Language", "fa".parse().unwrap());
     headers.insert("Origin", "https://my.irancell.ir".parse().unwrap());
     headers.insert("x-app-version", "9.62.0".parse().unwrap());
-    headers.insert("Authorization", reqwest::header::HeaderValue::from_str(token)?);
+    headers.insert("Authorization", HeaderValue::from_str(token)?);
     headers.insert("Content-Type", "application/json".parse().unwrap());
+
+    if !cookie_string.is_empty() {
+        if let Ok(val) = HeaderValue::from_str(cookie_string) {
+            headers.insert(COOKIE, val);
+        }
+    }
 
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
-        .cookie_provider(cookie_jar)
+        .cookie_store(false)
         .pool_idle_timeout(Duration::from_secs(90))
         .timeout(Duration::from_secs(15));
 
@@ -165,14 +189,6 @@ fn build_client(token: &str, proxy: Option<Proxy>, cookie_jar: Arc<Jar>) -> Resu
     }
 
     builder.build().context("Failed to build client")
-}
-
-async fn initialize_shared_cookies(token: &str, jar: Arc<Jar>) -> Result<()> {
-    println!("🍪 Initializing shared session cookies...");
-    let client = build_client(token, None, jar)?;
-    let _ = client.get(API_CHECK_APP).send().await;
-    println!("✅ Cookies acquired and shared.");
-    Ok(())
 }
 
 async fn fetch_proxies_list(_token: String, filter: ProxyFilter, silent: bool) -> Result<Vec<String>> {
@@ -285,13 +301,13 @@ async fn run_worker_robust(
     prefixes: Arc<Vec<String>>,
     success_counter: Arc<AtomicUsize>,
     failure_counter: Arc<AtomicUsize>,
-    global_index_counter: Arc<AtomicUsize>, // شمارنده سراسری برای یونیک بودن
-    start_offset: usize, // افست تصادفی
+    global_index_counter: Arc<AtomicUsize>,
+    start_offset: usize,
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
     use_send_invite: bool,
     refill_filter: Option<ProxyFilter>,
-    shared_jar: Arc<Jar>
+    cookie_str: Arc<String>
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -340,7 +356,7 @@ async fn run_worker_robust(
 
             if let Some(proxy_url) = pool.pop() {
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
-                    if let Ok(c) = build_client(&token, Some(proxy_obj), shared_jar.clone()) {
+                    if let Ok(c) = build_client(&token, Some(proxy_obj), &cookie_str) {
                         current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         consecutive_errors = 0;
                     }
@@ -361,17 +377,14 @@ async fn run_worker_robust(
                 let tx = status_tx.clone();
                 let s_rx = shutdown_rx.clone();
                 let flag_clone = active_flag.clone();
-                let offset_val = start_offset;
                 
                 tokio::spawn(async move {
                     let _p = permit; 
                     if *s_rx.borrow() { return; } 
                     if !flag_clone.load(Ordering::Relaxed) { return; }
 
-                    // دریافت ایندکس منحصر به فرد بعدی
                     let current_idx = idx_ref.fetch_add(1, Ordering::Relaxed);
-                    // تولید شماره موبایل یونیک
-                    let phone = generate_unique_number(current_idx, offset_val, &p_ref);
+                    let phone = generate_unique_number(current_idx, start_offset, &p_ref);
 
                     let status = perform_invite(&client, phone, &s_ref, &f_ref, target, use_send_invite).await;
                     let _ = tx.send(status).await;
@@ -557,19 +570,12 @@ async fn main() -> Result<()> {
 
     if raw_pool.is_empty() { return Err(anyhow!("❌ Pool is empty.")); }
 
-    let shared_jar = Arc::new(Jar::default());
-    
-    if let Err(e) = initialize_shared_cookies(&token, shared_jar.clone()).await {
-        println!("⚠️ Warning: Could not initialize cookies: {}", e);
-    }
+    let shared_cookie = Arc::new(get_initial_cookie_string(&token).await.unwrap_or_default());
 
     let shared_pool = Arc::new(Mutex::new(raw_pool));
     let success_counter = Arc::new(AtomicUsize::new(0));
     let failure_counter = Arc::new(AtomicUsize::new(0));
-    
-    // شمارنده سراسری برای تولید شماره منحصر به فرد
     let global_index_counter = Arc::new(AtomicUsize::new(0));
-    // ایجاد یک آفست رندوم در شروع برنامه تا در اجراهای مختلف شماره‌ها تکراری نشوند
     let start_offset = rand::rng().random_range(0..MODULO_SPACE);
     
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -586,14 +592,14 @@ async fn main() -> Result<()> {
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
         let f_ref = failure_counter.clone();
-        let idx_ref = global_index_counter.clone(); // پاس دادن رفرنس به شمارنده
+        let idx_ref = global_index_counter.clone();
         let rx = shutdown_rx.clone();
-        let jar_ref = shared_jar.clone(); 
+        let cookie_ref = shared_cookie.clone();
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
         if mode == RunMode::Direct {
-            let client = build_client(&token_clone, None, jar_ref)?;
+            let client = build_client(&token_clone, None, &cookie_ref)?;
             tokio::spawn(async move {
                 let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
@@ -606,7 +612,6 @@ async fn main() -> Result<()> {
                         let ir = idx_ref.clone();
                         tokio::spawn(async move {
                             let _p = permit;
-                            // تولید شماره یونیک در حالت دایرکت
                             let current_idx = ir.fetch_add(1, Ordering::Relaxed);
                             let phone = generate_unique_number(current_idx, start_offset, &pr);
                             perform_invite(&c, phone, &sr, &fr, target_count, use_send_invite).await;
@@ -616,7 +621,7 @@ async fn main() -> Result<()> {
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, f_ref, idx_ref, start_offset, target_count, rx, use_send_invite, refill_filter, jar_ref).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, f_ref, idx_ref, start_offset, target_count, rx, use_send_invite, refill_filter, cookie_ref).await;
             });
         }
     }
