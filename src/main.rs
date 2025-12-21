@@ -1,24 +1,25 @@
 use anyhow::{Context, Result, anyhow};
-use chrono::Local;
 use rand::prelude::*;
 use reqwest::{Client, Proxy};
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::fs::OpenOptions;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Semaphore, watch};
 use tokio::time::sleep;
 
 const CONFIG_FILE: &str = "config.json";
-const LOG_FILE: &str = "debug.log";
 const API_CHECK_APP: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend";
 const API_SEND_INVITE: &str = "https://my.irancell.ir/api/gift/v1/refer_a_friend/notify";
 const SOURCE_OF_SOURCES_URL: &str = "https://raw.githubusercontent.com/joestar9/jojo/refs/heads/main/proxy_links.json";
 const MAX_RETRIES_BEFORE_SWITCH: u8 = 3; 
+const PRIME_MULTIPLIER: usize = 6_786_793; 
+const MODULO_SPACE: usize = 10_000_000;
 
 #[derive(Clone, Copy, PartialEq)]
 enum RunMode {
@@ -43,16 +44,15 @@ enum ProxyStatus {
 }
 
 #[derive(Serialize)]
-struct InviteData {
-    application_name: String,
-    friend_number: String,
+struct InviteData<'a> {
+    application_name: &'a str,
+    friend_number: &'a str,
 }
 
 #[derive(Deserialize, Debug)]
 struct AppConfig {
     token: Option<String>,
     prefixes: Vec<String>,
-    debug: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -67,6 +67,46 @@ struct ProxySourceConfig {
     socks5: Vec<String>,
 }
 
+struct ErrorStats {
+    proxy_errors: AtomicUsize, 
+    forbidden_bans: AtomicUsize, // 403, 429
+    unauthorized: AtomicUsize, // 401
+    not_found: AtomicUsize, // 404
+    bad_requests: AtomicUsize, // 400
+    server_errors: AtomicUsize, // 500-599
+    logic_fail: AtomicUsize, // 200 OK but message != done
+    parse_fail: AtomicUsize, // 200 OK but invalid JSON/HTML
+    others: AtomicUsize, 
+}
+
+impl ErrorStats {
+    fn new() -> Self {
+        Self {
+            proxy_errors: AtomicUsize::new(0),
+            forbidden_bans: AtomicUsize::new(0),
+            unauthorized: AtomicUsize::new(0),
+            not_found: AtomicUsize::new(0),
+            bad_requests: AtomicUsize::new(0),
+            server_errors: AtomicUsize::new(0),
+            logic_fail: AtomicUsize::new(0),
+            parse_fail: AtomicUsize::new(0),
+            others: AtomicUsize::new(0),
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.proxy_errors.load(Ordering::Relaxed) +
+        self.forbidden_bans.load(Ordering::Relaxed) +
+        self.unauthorized.load(Ordering::Relaxed) +
+        self.not_found.load(Ordering::Relaxed) +
+        self.bad_requests.load(Ordering::Relaxed) +
+        self.server_errors.load(Ordering::Relaxed) +
+        self.logic_fail.load(Ordering::Relaxed) +
+        self.parse_fail.load(Ordering::Relaxed) +
+        self.others.load(Ordering::Relaxed)
+    }
+}
+
 fn read_config() -> Result<AppConfig> {
     if !std::path::Path::new(CONFIG_FILE).exists() {
         return Err(anyhow!("❌ '{}' not found.", CONFIG_FILE));
@@ -78,10 +118,13 @@ fn read_config() -> Result<AppConfig> {
     Ok(config)
 }
 
-fn generate_random_suffix() -> String {
-    let chars: Vec<char> = "1234567890".chars().collect();
-    let mut rng = rand::rng(); 
-    chars.choose_multiple(&mut rng, 7).collect()
+fn generate_unique_number(global_index: usize, start_offset: usize, prefixes: &[String]) -> String {
+    let prefix_idx = global_index % prefixes.len();
+    let prefix = &prefixes[prefix_idx];
+    let sequence_num = global_index / prefixes.len();
+    let effective_index = sequence_num + start_offset;
+    let unique_suffix_val = (effective_index * PRIME_MULTIPLIER) % MODULO_SPACE;
+    format!("98{}{:07}", prefix, unique_suffix_val)
 }
 
 fn prompt_input(prompt: &str) -> String {
@@ -90,13 +133,6 @@ fn prompt_input(prompt: &str) -> String {
     let mut buffer = String::new();
     io::stdin().read_line(&mut buffer).unwrap();
     buffer.trim().to_string()
-}
-
-async fn log_debug(msg: String) {
-    let timestamp = Local::now().format("%H:%M:%S");
-    let log_line = format!("[{}] {}\n", timestamp, msg);
-    let result = OpenOptions::new().create(true).append(true).open(LOG_FILE);
-    if let Ok(mut file) = result { let _ = file.write_all(log_line.as_bytes()); }
 }
 
 fn format_proxy_url(raw: &str, default_proto: &str) -> String {
@@ -132,22 +168,62 @@ fn format_proxy_url(raw: &str, default_proto: &str) -> String {
     clean
 }
 
-fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
-    let mut headers = reqwest::header::HeaderMap::new();
+async fn get_initial_cookie_string(token: &str) -> Result<String> {
+    println!("🍪 Fetching initial cookies...");
+    
+    let mut headers = HeaderMap::new();
+    headers.insert("Authorization", HeaderValue::from_str(token)?);
+    headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
+    
+    let client = Client::builder()
+        .default_headers(headers)
+        .cookie_store(true) 
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let resp = client.get(API_CHECK_APP).send().await?;
+    
+    let cookies: Vec<String> = resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap_or("").split(';').next().unwrap_or("").to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if cookies.is_empty() {
+        println!("⚠️ No cookies received from server. Proceeding without cookies.");
+        return Ok(String::new());
+    }
+
+    let cookie_string = cookies.join("; ");
+    println!("✅ Cookies acquired: {}", cookie_string);
+    Ok(cookie_string)
+}
+
+fn build_client(token: &str, proxy: Option<Proxy>, cookie_string: &str) -> Result<Client> {
+    let mut headers = HeaderMap::new();
     headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0".parse().unwrap());
     headers.insert("Accept", "application/json, text/plain, */*".parse().unwrap());
     headers.insert("Accept-Language", "fa".parse().unwrap());
     headers.insert("Origin", "https://my.irancell.ir".parse().unwrap());
     headers.insert("x-app-version", "9.62.0".parse().unwrap());
-    headers.insert("Authorization", reqwest::header::HeaderValue::from_str(token)?);
+    headers.insert("Authorization", HeaderValue::from_str(token)?);
     headers.insert("Content-Type", "application/json".parse().unwrap());
+
+    if !cookie_string.is_empty() {
+        if let Ok(val) = HeaderValue::from_str(cookie_string) {
+            headers.insert(COOKIE, val);
+        }
+    }
 
     let mut builder = Client::builder()
         .default_headers(headers)
         .tcp_nodelay(true)
-        .cookie_store(true)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(15));
+        .tcp_keepalive(Duration::from_secs(60))
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(10))
+        .cookie_store(false)
+        .timeout(Duration::from_secs(10));
 
     if let Some(p) = proxy {
         builder = builder.proxy(p);
@@ -156,8 +232,8 @@ fn build_client(token: &str, proxy: Option<Proxy>) -> Result<Client> {
     builder.build().context("Failed to build client")
 }
 
-async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<String>> {
-    println!("⏳ Connecting to GitHub to fetch proxy sources...");
+async fn fetch_proxies_list(_token: String, filter: ProxyFilter, silent: bool) -> Result<Vec<String>> {
+    if !silent { println!("⏳ Connecting to GitHub to fetch proxy sources..."); }
     let fetcher = Client::builder().timeout(Duration::from_secs(30)).build()?;
     
     let json_text = match fetcher.get(SOURCE_OF_SOURCES_URL).send().await {
@@ -176,7 +252,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
     let spawn_download = |url: String, proto: &'static str, client: Client| {
         tokio::spawn(async move {
             let mut found = Vec::new();
-            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(15)).send().await {
+            if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(10)).send().await {
                 if let Ok(text) = resp.text().await {
                     for line in text.lines() {
                         let p = line.trim();
@@ -192,26 +268,26 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
 
     match filter {
         ProxyFilter::All => {
-            println!("🌐 Fetching ALL proxy types...");
+            if !silent { println!("🌐 Fetching ALL proxy types..."); }
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
             for url in sources.https { tasks.push(spawn_download(url, "https", fetcher.clone())); }
             for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
         },
         ProxyFilter::Http => {
-            println!("🌐 Fetching ONLY HTTP proxies...");
+            if !silent { println!("🌐 Fetching ONLY HTTP proxies..."); }
             for url in sources.http { tasks.push(spawn_download(url, "http", fetcher.clone())); }
         },
         ProxyFilter::Https => {
-            println!("🌐 Fetching ONLY HTTPS proxies...");
+            if !silent { println!("🌐 Fetching ONLY HTTPS proxies..."); }
             for url in sources.https { tasks.push(spawn_download(url, "https", fetcher.clone())); }
         },
         ProxyFilter::Socks4 => {
-            println!("🌐 Fetching ONLY SOCKS4 proxies...");
+            if !silent { println!("🌐 Fetching ONLY SOCKS4 proxies..."); }
             for url in sources.socks4 { tasks.push(spawn_download(url, "socks4", fetcher.clone())); }
         },
         ProxyFilter::Socks5 => {
-            println!("🌐 Fetching ONLY SOCKS5 proxies...");
+            if !silent { println!("🌐 Fetching ONLY SOCKS5 proxies..."); }
             for url in sources.socks5 { tasks.push(spawn_download(url, "socks5h", fetcher.clone())); }
         },
     }
@@ -220,7 +296,7 @@ async fn fetch_proxies_list(_token: String, filter: ProxyFilter) -> Result<Vec<S
         return Err(anyhow!("No sources found for the selected type."));
     }
 
-    println!("⬇️  Downloading from {} sources...", tasks.len());
+    if !silent { println!("⬇️  Downloading from {} sources...", tasks.len()); }
     
     for task in tasks {
         if let Ok(proxies) = task.await {
@@ -241,6 +317,7 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
     let file = File::open(clean_path).context(format!("Could not open file: {}", clean_path))?;
     let reader = BufReader::new(file);
     let mut unique_set = HashSet::new();
+
     println!("📁 Processing local proxies from '{}'...", clean_path);
     
     for line in reader.lines() {
@@ -259,23 +336,24 @@ fn read_local_list(file_path: &str, default_proto: &str) -> Result<Vec<String>> 
 }
 
 async fn run_worker_robust(
-    worker_id: usize,
+    _worker_id: usize,
     proxy_pool: Arc<Mutex<Vec<String>>>,
     token: String,
     concurrency_limit: usize,
     prefixes: Arc<Vec<String>>,
-    success_counter: Arc<Mutex<usize>>,
+    success_counter: Arc<AtomicUsize>,
+    error_stats: Arc<ErrorStats>, 
+    global_index_counter: Arc<AtomicUsize>,
+    start_offset: usize,
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
-    debug_mode: bool,
     use_send_invite: bool,
-    refill_filter: Option<ProxyFilter>
+    refill_filter: Option<ProxyFilter>,
+    cookie_str: Arc<String>
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
-
-    let mut current_client: Option<Client> = None;
-    let mut current_proxy_addr: String = String::new();
+    let mut current_client: Option<(Client, Arc<AtomicBool>)> = None;
     let mut consecutive_errors: u8 = 0;
 
     loop {
@@ -293,29 +371,33 @@ async fn run_worker_robust(
         }
 
         if consecutive_errors >= MAX_RETRIES_BEFORE_SWITCH {
-            if debug_mode { 
-                log_debug(format!("♻️ Worker {} switching. Failed: {}", worker_id, current_proxy_addr)).await; 
+            if let Some((_, active_flag)) = &current_client {
+                active_flag.store(false, Ordering::Relaxed);
             }
             current_client = None; 
             consecutive_errors = 0; 
         }
 
         if current_client.is_none() {
-            let mut pool = proxy_pool.lock().await;
+            let needs_refill = {
+                let pool = proxy_pool.lock().await;
+                pool.is_empty()
+            };
 
-            if pool.is_empty() {
+            if needs_refill {
                 if let Some(filter) = refill_filter {
-                    if let Ok(new_proxies) = fetch_proxies_list(token.clone(), filter).await {
+                    if let Ok(new_proxies) = fetch_proxies_list(token.clone(), filter, true).await {
+                        let mut pool = proxy_pool.lock().await;
                         pool.extend(new_proxies);
                     }
                 }
             }
 
+            let mut pool = proxy_pool.lock().await;
             if let Some(proxy_url) = pool.pop() {
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
-                    if let Ok(c) = build_client(&token, Some(proxy_obj)) {
-                        current_client = Some(c);
-                        current_proxy_addr = proxy_url;
+                    if let Ok(c) = build_client(&token, Some(proxy_obj), &cookie_str) {
+                        current_client = Some((c, Arc::new(AtomicBool::new(true))));
                         consecutive_errors = 0;
                     }
                 }
@@ -326,22 +408,25 @@ async fn run_worker_robust(
             }
         }
 
-        if let Some(client) = current_client.clone() {
+        if let Some((client, active_flag)) = current_client.clone() {
             if let Ok(permit) = sem.clone().acquire_owned().await {
                 let p_ref = prefixes.clone();
                 let s_ref = success_counter.clone();
-                let p_addr = current_proxy_addr.clone();
+                let err_ref = error_stats.clone();
+                let idx_ref = global_index_counter.clone();
                 let tx = status_tx.clone();
                 let s_rx = shutdown_rx.clone();
+                let flag_clone = active_flag.clone();
                 
                 tokio::spawn(async move {
                     let _p = permit; 
                     if *s_rx.borrow() { return; } 
+                    if !flag_clone.load(Ordering::Relaxed) { return; }
 
-                    let prefix = p_ref.choose(&mut rand::rng()).unwrap();
-                    let phone = format!("98{}{}", prefix, generate_random_suffix());
-
-                    let status = perform_invite(worker_id, &p_addr, &client, phone, &s_ref, debug_mode, target, use_send_invite).await;
+                    let current_idx = idx_ref.fetch_add(1, Ordering::Relaxed);
+                    let phone = generate_unique_number(current_idx, start_offset, &p_ref);
+                    
+                    let status = perform_invite(&client, phone, &s_ref, &err_ref, target, use_send_invite).await;
                     let _ = tx.send(status).await;
                 });
             }
@@ -350,18 +435,19 @@ async fn run_worker_robust(
 }
 
 async fn perform_invite(
-    id: usize,
-    proxy_name: &str,
     client: &Client,
     phone: String,
-    success_counter: &Arc<Mutex<usize>>,
-    debug_mode: bool,
+    success_counter: &Arc<AtomicUsize>,
+    error_stats: &Arc<ErrorStats>,
     target: usize,
     use_send_invite: bool
 ) -> ProxyStatus {
-    if *success_counter.lock().await >= target { return ProxyStatus::Healthy; }
-
-    let data = InviteData { application_name: "NGMI".to_string(), friend_number: phone.clone() };
+    if success_counter.load(Ordering::Relaxed) >= target { return ProxyStatus::Healthy; }
+    
+    let data = InviteData { 
+        application_name: "NGMI", 
+        friend_number: &phone 
+    };
 
     let res1 = client.post(API_CHECK_APP)
         .header("Referer", "https://my.irancell.ir/invite")
@@ -370,19 +456,14 @@ async fn perform_invite(
     match res1 {
         Ok(resp) => {
             let status_code = resp.status();
-            
-            if status_code == 403 || status_code == 429 || status_code == 407 {
-                return ProxyStatus::HardFail; 
-            }
+            let code_u16 = status_code.as_u16();
 
-            if status_code.as_u16() == 200 {
+            if status_code.is_success() { 
                 let text = resp.text().await.unwrap_or_default();
                 if let Ok(body) = serde_json::from_str::<Value>(&text) {
                     if body["message"] == "done" {
                         if !use_send_invite {
-                            let mut lock = success_counter.lock().await;
-                            *lock += 1;
-                            println!("✅ Worker #{} | Proxy {} | App Checked: {} ({}/{})", id, proxy_name, phone, *lock, target);
+                            success_counter.fetch_add(1, Ordering::Relaxed);
                             return ProxyStatus::Healthy;
                         }
                         
@@ -392,33 +473,83 @@ async fn perform_invite(
 
                         match res2 {
                             Ok(resp2) => {
-                                if resp2.status().as_u16() == 200 {
+                                let code2 = resp2.status().as_u16();
+                                if code2 == 200 {
                                     let text2 = resp2.text().await.unwrap_or_default();
                                     if let Ok(body2) = serde_json::from_str::<Value>(&text2) {
                                         if body2["message"] == "done" {
-                                            let mut lock = success_counter.lock().await;
-                                            *lock += 1;
-                                            println!("✅ Worker #{} | Proxy {} | Sent: {} ({}/{})", id, proxy_name, phone, *lock, target);
+                                            success_counter.fetch_add(1, Ordering::Relaxed);
                                             return ProxyStatus::Healthy;
+                                        } else {
+                                            error_stats.logic_fail.fetch_add(1, Ordering::Relaxed);
+                                            return ProxyStatus::Healthy; 
                                         }
+                                    } else {
+                                        error_stats.parse_fail.fetch_add(1, Ordering::Relaxed);
+                                        return ProxyStatus::SoftFail;
                                     }
+                                } 
+                                if code2 == 403 || code2 == 429 || code2 == 407 {
+                                    error_stats.forbidden_bans.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::HardFail;
+                                } else if code2 == 401 {
+                                    error_stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::SoftFail;
+                                } else if code2 == 404 {
+                                    error_stats.not_found.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::SoftFail;
+                                } else if code2 >= 500 {
+                                    error_stats.server_errors.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::SoftFail;
+                                } else {
+                                    error_stats.others.fetch_add(1, Ordering::Relaxed);
+                                    return ProxyStatus::SoftFail;
                                 }
-                                return ProxyStatus::SoftFail;
                             },
                             Err(_) => {
+                                error_stats.proxy_errors.fetch_add(1, Ordering::Relaxed);
                                 return ProxyStatus::HardFail;
                             }
                         }
+                    } else {
+                        error_stats.logic_fail.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::Healthy; 
+                    }
+                } else {
+                    error_stats.parse_fail.fetch_add(1, Ordering::Relaxed);
+                    return ProxyStatus::SoftFail;
+                }
+            } else {
+                match code_u16 {
+                    403 | 429 | 407 => {
+                        error_stats.forbidden_bans.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::HardFail; 
+                    },
+                    401 => {
+                        error_stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
+                    },
+                    400 => {
+                        error_stats.bad_requests.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
+                    },
+                    404 => {
+                        error_stats.not_found.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
+                    },
+                    500..=599 => {
+                        error_stats.server_errors.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
+                    },
+                    _ => {
+                        error_stats.others.fetch_add(1, Ordering::Relaxed);
+                        return ProxyStatus::SoftFail;
                     }
                 }
-                return ProxyStatus::Healthy;
-            } else {
-                if debug_mode { log_debug(format!("Worker {} HTTP {} on {}", id, status_code, phone)).await; }
-                return ProxyStatus::SoftFail; 
             }
         },
-        Err(e) => {
-            if debug_mode { log_debug(format!("Worker {} Net Error: {}", id, e)).await; }
+        Err(_) => {
+            error_stats.proxy_errors.fetch_add(1, Ordering::Relaxed);
             return ProxyStatus::HardFail; 
         }
     }
@@ -427,18 +558,14 @@ async fn perform_invite(
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = read_config()?;
-    let debug_mode = config.debug.unwrap_or(false);
-    if debug_mode {
-        println!("🐞 Debug Mode ON.");
-        log_debug("--- SESSION STARTED ---".to_string()).await;
-    }
-
+    
     let token = match config.token {
         Some(t) if !t.trim().is_empty() => t,
         _ => prompt_input("🔑 Enter Token: "),
     };
 
     println!("📱 Loaded {} prefixes.", config.prefixes.len());
+
     let count_input = prompt_input("🎯 Target SUCCESS Count: ");
     let target_count: usize = count_input.parse().unwrap_or(1000);
 
@@ -526,7 +653,7 @@ async fn main() -> Result<()> {
         raw_pool = read_local_list(&local_file_path, default_local_proto)?;
         println!("📦 Loaded {} local proxies.", raw_pool.len());
     } else if mode == RunMode::AutoProxy {
-        raw_pool = fetch_proxies_list(token.clone(), proxy_filter).await?;
+        raw_pool = fetch_proxies_list(token.clone(), proxy_filter, false).await?;
         println!("📦 Downloaded {} proxies.", raw_pool.len());
     } else {
         raw_pool.push("Direct".to_string());
@@ -534,24 +661,37 @@ async fn main() -> Result<()> {
 
     if raw_pool.is_empty() { return Err(anyhow!("❌ Pool is empty.")); }
 
+    let shared_cookie = Arc::new(get_initial_cookie_string(&token).await.unwrap_or_default());
     let shared_pool = Arc::new(Mutex::new(raw_pool));
-    let success_counter = Arc::new(Mutex::new(0));
+    
+    let success_counter = Arc::new(AtomicUsize::new(0));
+    
+    let error_stats = Arc::new(ErrorStats::new());
+
+    let global_index_counter = Arc::new(AtomicUsize::new(0));
+    let start_offset = rand::rng().random_range(0..MODULO_SPACE);
+    
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
 
     println!("🚀 Launching {} worker threads...", worker_count);
+    sleep(Duration::from_secs(1)).await;
+    print!("\x1B[2J\x1B[1;1H");
 
     for id in 0..worker_count {
         let pool = shared_pool.clone();
         let token_clone = token.clone();
         let p_ref = prefixes.clone();
         let s_ref = success_counter.clone();
+        let err_ref = error_stats.clone();
+        let idx_ref = global_index_counter.clone();
         let rx = shutdown_rx.clone();
+        let cookie_ref = shared_cookie.clone();
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
         if mode == RunMode::Direct {
-            let client = build_client(&token_clone, None)?;
+            let client = build_client(&token_clone, None, &cookie_ref)?;
             tokio::spawn(async move {
                 let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
@@ -560,28 +700,67 @@ async fn main() -> Result<()> {
                         let c = client.clone();
                         let pr = p_ref.clone();
                         let sr = s_ref.clone();
+                        let er = err_ref.clone();
+                        let ir = idx_ref.clone();
+                        
                         tokio::spawn(async move {
                             let _p = permit;
-                            let prefix = pr.choose(&mut rand::rng()).unwrap();
-                            let phone = format!("98{}{}", prefix, generate_random_suffix());
-                            perform_invite(id, "DIRECT", &c, phone, &sr, debug_mode, target_count, use_send_invite).await;
+                            let current_idx = ir.fetch_add(1, Ordering::Relaxed);
+                            let phone = generate_unique_number(current_idx, start_offset, &pr);
+                            perform_invite(&c, phone, &sr, &er, target_count, use_send_invite).await;
                         });
                     }
                 }
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite, refill_filter).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, err_ref, idx_ref, start_offset, target_count, rx, use_send_invite, refill_filter, cookie_ref).await;
             });
         }
     }
 
     let monitor_success = success_counter.clone();
+    let monitor_errors = error_stats.clone();
     let monitor_tx = shutdown_tx.clone();
+    let start_time = Instant::now();
     
     loop {
-        sleep(Duration::from_secs(1)).await;
-        if *monitor_success.lock().await >= target_count {
+        sleep(Duration::from_secs(2)).await;
+        let success = monitor_success.load(Ordering::Relaxed);
+        
+        let proxy_errs = monitor_errors.proxy_errors.load(Ordering::Relaxed);
+        let bans = monitor_errors.forbidden_bans.load(Ordering::Relaxed);
+        let unauth = monitor_errors.unauthorized.load(Ordering::Relaxed);
+        let not_found = monitor_errors.not_found.load(Ordering::Relaxed);
+        let bad_reqs = monitor_errors.bad_requests.load(Ordering::Relaxed);
+        let server_errs = monitor_errors.server_errors.load(Ordering::Relaxed);
+        let logic = monitor_errors.logic_fail.load(Ordering::Relaxed);
+        let parse = monitor_errors.parse_fail.load(Ordering::Relaxed);
+        let others = monitor_errors.others.load(Ordering::Relaxed);
+        let total_fails = monitor_errors.total();
+
+        print!("\x1B[2J\x1B[1;1H"); 
+        
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("           🚀 IRANCELL INVITE BOT STATUS         ");
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!(" ✅ Success: \x1B[32m{}\x1B[0m", success);
+        println!(" ❌ Total Failed: \x1B[31m{}\x1B[0m", total_fails);
+        println!(" -----------------------------------------------");
+        println!(" 🔌 Proxy/Net Errors:  \x1B[33m{}\x1B[0m", proxy_errs);
+        println!(" 🚫 Bans (403/429):    \x1B[35m{}\x1B[0m", bans);
+        println!(" 🔐 Unauthorized (401):\x1B[31m{}\x1B[0m", unauth);
+        println!(" 🔍 Not Found (404):   \x1B[34m{}\x1B[0m", not_found);
+        println!(" ⚠️ Bad Req (400):     \x1B[36m{}\x1B[0m", bad_reqs);
+        println!(" 🔥 Server Err (5xx):  \x1B[31m{}\x1B[0m", server_errs);
+        println!(" 🧠 Logic Fail (Msg):  \x1B[37m{}\x1B[0m", logic);
+        println!(" 📄 Parse Fail (HTML): \x1B[90m{}\x1B[0m", parse);
+        println!(" ❓ Other Errors:      {}", others);
+        println!(" -----------------------------------------------");
+        println!(" ⏳ Elapsed: {:.2?}", start_time.elapsed());
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        
+        if success >= target_count {
             let _ = monitor_tx.send(true);
             break;
         }
@@ -589,6 +768,18 @@ async fn main() -> Result<()> {
 
     println!("🏁 Target reached. Stopping...");
     sleep(Duration::from_secs(2)).await;
-    println!("\n📊 Final Results: {} Successes", *success_counter.lock().await);
+
+    println!("\n📊 Final Results:");
+    println!("✅ Successes: {}", success_counter.load(Ordering::Relaxed));
+    println!("🔌 Proxy Errors: {}", error_stats.proxy_errors.load(Ordering::Relaxed));
+    println!("🚫 Bans/Forbidden: {}", error_stats.forbidden_bans.load(Ordering::Relaxed));
+    println!("🔐 Unauthorized: {}", error_stats.unauthorized.load(Ordering::Relaxed));
+    println!("🔍 Not Found: {}", error_stats.not_found.load(Ordering::Relaxed));
+    println!("⚠️ Bad Requests: {}", error_stats.bad_requests.load(Ordering::Relaxed));
+    println!("🔥 Server Errors: {}", error_stats.server_errors.load(Ordering::Relaxed));
+    println!("🧠 Logic Fails: {}", error_stats.logic_fail.load(Ordering::Relaxed));
+    println!("📄 Parse Fails: {}", error_stats.parse_fail.load(Ordering::Relaxed));
+    println!("❓ Others: {}", error_stats.others.load(Ordering::Relaxed));
+    
     Ok(())
 }
