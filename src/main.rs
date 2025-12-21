@@ -268,7 +268,8 @@ async fn run_worker_robust(
     target: usize,
     shutdown_rx: watch::Receiver<bool>,
     debug_mode: bool,
-    use_send_invite: bool
+    use_send_invite: bool,
+    refill_filter: Option<ProxyFilter>
 ) {
     let (status_tx, mut status_rx) = mpsc::channel::<ProxyStatus>(concurrency_limit + 10);
     let sem = Arc::new(Semaphore::new(concurrency_limit));
@@ -301,6 +302,15 @@ async fn run_worker_robust(
 
         if current_client.is_none() {
             let mut pool = proxy_pool.lock().await;
+
+            if pool.is_empty() {
+                if let Some(filter) = refill_filter {
+                    if let Ok(new_proxies) = fetch_proxies_list(token.clone(), filter).await {
+                        pool.extend(new_proxies);
+                    }
+                }
+            }
+
             if let Some(proxy_url) = pool.pop() {
                 if let Ok(proxy_obj) = Proxy::all(&proxy_url) {
                     if let Ok(c) = build_client(&token, Some(proxy_obj)) {
@@ -434,7 +444,7 @@ async fn main() -> Result<()> {
 
     println!("\n✨ Select Mode:");
     println!("1) Direct Mode (No Proxy) 🌐");
-    println!("2) Auto Proxy Mode (Online SourcesS 🚀");
+    println!("2) Auto Proxy Mode (Online Sources) 🚀");
     println!("3) Local Proxy Mode (File) 📁");
     
     let mode_input = prompt_input("Choice [1-3]: ");
@@ -538,6 +548,8 @@ async fn main() -> Result<()> {
         let s_ref = success_counter.clone();
         let rx = shutdown_rx.clone();
         
+        let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
+
         if mode == RunMode::Direct {
             let client = build_client(&token_clone, None)?;
             tokio::spawn(async move {
@@ -559,7 +571,7 @@ async fn main() -> Result<()> {
             });
         } else {
             tokio::spawn(async move {
-                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite).await;
+                run_worker_robust(id, pool, token_clone, requests_per_proxy, p_ref, s_ref, target_count, rx, debug_mode, use_send_invite, refill_filter).await;
             });
         }
     }
