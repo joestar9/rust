@@ -674,6 +674,13 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let prefixes = Arc::new(config.prefixes);
 
+    // Direct-mode global throttle:
+    // After each successful invite we pause for 5 minutes.
+    // Using a semaphore with 1 permit ensures this pause is global
+    // even if the user starts multiple workers.
+    let direct_success_pause = Duration::from_secs(5 * 60);
+    let direct_gate = Arc::new(Semaphore::new(1));
+
     println!("🚀 Launching {} worker threads...", worker_count);
     sleep(Duration::from_secs(1)).await;
     print!("\x1B[2J\x1B[1;1H");
@@ -687,29 +694,36 @@ async fn main() -> Result<()> {
         let idx_ref = global_index_counter.clone();
         let rx = shutdown_rx.clone();
         let cookie_ref = shared_cookie.clone();
+        let direct_gate_ref = direct_gate.clone();
         
         let refill_filter = if mode == RunMode::AutoProxy { Some(proxy_filter) } else { None };
 
         if mode == RunMode::Direct {
             let client = build_client(&token_clone, None, &cookie_ref)?;
             tokio::spawn(async move {
-                let sem = Arc::new(Semaphore::new(requests_per_proxy));
                 loop {
                     if *rx.borrow() { break; }
-                    if let Ok(permit) = sem.clone().acquire_owned().await {
-                        let c = client.clone();
-                        let pr = p_ref.clone();
-                        let sr = s_ref.clone();
-                        let er = err_ref.clone();
-                        let ir = idx_ref.clone();
-                        
-                        tokio::spawn(async move {
-                            let _p = permit;
-                            let current_idx = ir.fetch_add(1, Ordering::Relaxed);
-                            let phone = generate_unique_number(current_idx, start_offset, &pr);
-                            perform_invite(&c, phone, &sr, &er, target_count, use_send_invite).await;
-                        });
+
+                    // Global throttle for direct mode: one in-flight request at a time.
+                    // On each success, we hold the permit during the sleep, effectively pausing.
+                    let permit = match direct_gate_ref.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+
+                    let current_idx = idx_ref.fetch_add(1, Ordering::Relaxed);
+                    let phone = generate_unique_number(current_idx, start_offset, &p_ref);
+
+                    let before = s_ref.load(Ordering::Relaxed);
+                    perform_invite(&client, phone, &s_ref, &err_ref, target_count, use_send_invite).await;
+                    let after = s_ref.load(Ordering::Relaxed);
+
+                    if after > before {
+                        // Successful invite: pause 5 minutes (global).
+                        sleep(direct_success_pause).await;
                     }
+
+                    drop(permit);
                 }
             });
         } else {
